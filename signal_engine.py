@@ -11,6 +11,7 @@ Prinsip:
 4. Volume & RSI Sweet Spot: Volume buyer/seller terkonfirmasi dan RSI punya ruang gerak.
 """
 
+import time
 import pandas as pd
 import ta as ta_lib
 import config
@@ -22,6 +23,7 @@ class SignalEngine:
     
     def __init__(self, exchange):
         self.exchange = exchange
+        self._btcdom_cache = {}
     
     def fetch_candles(self, symbol, timeframe, limit=None):
         """Fetch OHLCV candles dari exchange."""
@@ -63,6 +65,71 @@ class SignalEngine:
         
         return df
 
+    def calculate_initial_stop(self, symbol, side, entry_price, dataframe=None):
+        """Bangun hard-stop awal dari ATR, EMA55, dan swing structure 15m."""
+        try:
+            df = dataframe
+            if df is None:
+                df = self.fetch_candles(symbol, config.TRADING_TIMEFRAME)
+                if df.empty:
+                    return None
+                df = self.calculate_indicators(df)
+            if df.empty or len(df) < 3 or entry_price <= 0:
+                return None
+
+            # Candle terakhir dapat masih berjalan. Struktur menggunakan candle
+            # yang sudah closed agar stop tidak berubah karena wick sementara.
+            closed = df.iloc[:-1] if len(df) > 3 else df
+            last = closed.iloc[-1]
+            atr = float(last.get("atr", 0) or 0)
+            ema55 = float(last.get("ema_55", 0) or 0)
+            if atr <= 0 or ema55 <= 0:
+                return None
+
+            lookback = max(3, int(getattr(config, "INITIAL_STOP_SWING_LOOKBACK", 20)))
+            window = closed.tail(lookback)
+            swing_low = float(window["low"].min())
+            swing_high = float(window["high"].max())
+            atr_mult = float(getattr(config, "INITIAL_STOP_ATR_MULTIPLIER", 1.5))
+            atr_buffer = float(getattr(config, "INITIAL_STOP_ATR_BUFFER", 0.25))
+            min_pct = float(getattr(config, "INITIAL_STOP_MIN_DISTANCE_PERCENT", 1.0))
+            max_pct = float(getattr(config, "INITIAL_STOP_MAX_DISTANCE_PERCENT", 5.0))
+            if min_pct <= 0 or max_pct < min_pct:
+                raise ValueError("Konfigurasi jarak initial stop tidak valid")
+
+            if side.lower() == "long":
+                structure = min(ema55, swing_low)
+                structure_stop = structure - (atr_buffer * atr)
+                atr_stop = entry_price - (atr_mult * atr)
+                raw_stop = min(structure_stop, atr_stop)
+                lower = entry_price * (1 - max_pct / 100)
+                upper = entry_price * (1 - min_pct / 100)
+                stop_price = max(lower, min(upper, raw_stop))
+            else:
+                structure = max(ema55, swing_high)
+                structure_stop = structure + (atr_buffer * atr)
+                atr_stop = entry_price + (atr_mult * atr)
+                raw_stop = max(structure_stop, atr_stop)
+                lower = entry_price * (1 + min_pct / 100)
+                upper = entry_price * (1 + max_pct / 100)
+                stop_price = min(upper, max(lower, raw_stop))
+
+            distance_pct = abs(entry_price - stop_price) / entry_price * 100
+            return {
+                "stop_price": float(stop_price),
+                "distance_pct": float(distance_pct),
+                "atr": atr,
+                "ema55": ema55,
+                "swing_low": swing_low,
+                "swing_high": swing_high,
+                "structure_price": structure,
+                "timeframe": config.TRADING_TIMEFRAME,
+                "method": "atr_ema55_swing",
+            }
+        except Exception as e:
+            logger.error(f"❌ Gagal menghitung adaptive initial stop {symbol}: {e}")
+            return None
+
     def _get_macro_trend(self, symbol):
         """
         Evaluasi tren makro pada timeframe 1H.
@@ -93,6 +160,133 @@ class SignalEngine:
             return "bearish"
             
         return "neutral"
+
+    def _is_btc_symbol(self, symbol):
+        """BTC.D hanya menjadi directional filter untuk posisi altcoin."""
+        return symbol.split("/")[0].upper() == "BTC"
+
+    def _get_btcdom_context(self, timeframe=None):
+        """Ambil regime BTC dominance dari closed candle BTCDOMUSDT."""
+        timeframe = timeframe or getattr(config, "BTCDOM_TIMEFRAME", "1h")
+        neutral = {
+            "trend": "neutral",
+            "projection": "balanced",
+            "reason": "btcdom_unavailable",
+            "timeframe": timeframe,
+        }
+
+        if not getattr(config, "BTCDOM_FILTER_ENABLED", True):
+            return {**neutral, "reason": "btcdom_filter_disabled"}
+
+        now = time.time()
+        cache_ttl = getattr(config, "BTCDOM_CACHE_SECONDS", 60)
+        cached = self._btcdom_cache.get(timeframe)
+        if cached and now - cached["fetched_at"] < cache_ttl:
+            return cached["context"].copy()
+
+        symbol = getattr(config, "BTCDOM_SYMBOL", "BTCDOM/USDT:USDT")
+        df = self.fetch_candles(symbol, timeframe)
+        if df.empty:
+            self._btcdom_cache[timeframe] = {
+                "fetched_at": now,
+                "context": neutral,
+            }
+            return neutral
+
+        df = self.calculate_indicators(df)
+        if df.empty or len(df) < 56:
+            self._btcdom_cache[timeframe] = {
+                "fetched_at": now,
+                "context": neutral,
+            }
+            return neutral
+
+        # Index -1 umumnya candle aktif, sehingga regime memakai candle -2.
+        closed = df.iloc[-2]
+        previous = df.iloc[-3]
+        close = float(closed["close"])
+        prev_close = float(previous["close"])
+        ema_21 = float(closed.get("ema_21", 0) or 0)
+        ema_55 = float(closed.get("ema_55", 0) or 0)
+        prev_ema_21 = float(previous.get("ema_21", 0) or 0)
+
+        trend = "neutral"
+        projection = "balanced"
+        reason = "btcdom_mixed_structure"
+
+        if close > ema_21 > ema_55 and ema_21 >= prev_ema_21 and close >= prev_close:
+            trend = "bullish"
+            projection = "btc_strength_alt_pressure"
+            reason = "btcdom_rising"
+        elif close < ema_21 < ema_55 and ema_21 <= prev_ema_21 and close <= prev_close:
+            trend = "bearish"
+            projection = "alt_strength_btcdom_weakness"
+            reason = "btcdom_falling"
+
+        context = {
+            "trend": trend,
+            "projection": projection,
+            "reason": reason,
+            "timeframe": timeframe,
+            "price": round(close, 6),
+            "ema_21": round(ema_21, 6),
+            "ema_55": round(ema_55, 6),
+        }
+        self._btcdom_cache[timeframe] = {
+            "fetched_at": now,
+            "context": context,
+        }
+        return context.copy()
+
+    def _check_btcdom_exit_reversal(self, current_side):
+        """Konfirmasi exit altcoin dari closed candle BTC dominance."""
+        if not getattr(config, "BTCDOM_EXIT_ON_REVERSAL", True):
+            return False, {}
+
+        timeframe = getattr(config, "BTCDOM_EXIT_TIMEFRAME", "15m")
+        symbol = getattr(config, "BTCDOM_SYMBOL", "BTCDOM/USDT:USDT")
+        required = max(2, int(getattr(config, "BTCDOM_EXIT_CONFIRMATION_CANDLES", 2)))
+
+        df = self.fetch_candles(symbol, timeframe)
+        if df.empty:
+            return False, {}
+
+        df = self.calculate_indicators(df)
+        if df.empty or len(df) < 55 + required:
+            return False, {}
+
+        # Exclude candle aktif dan validasi semua closed candle konfirmasi.
+        closed = df.iloc[-(required + 1):-1]
+        if len(closed) < required:
+            return False, {}
+
+        if current_side == "long":
+            aligned = (
+                (closed["close"] > closed["ema_21"])
+                & (closed["ema_21"] > closed["ema_55"])
+            ).all()
+            momentum = closed["close"].iloc[-1] > closed["close"].iloc[0]
+            reversed_against_position = bool(aligned and momentum)
+            regime = "bullish"
+            reason = "btcdom_bullish_reversal_against_alt_long"
+        else:
+            aligned = (
+                (closed["close"] < closed["ema_21"])
+                & (closed["ema_21"] < closed["ema_55"])
+            ).all()
+            momentum = closed["close"].iloc[-1] < closed["close"].iloc[0]
+            reversed_against_position = bool(aligned and momentum)
+            regime = "bearish"
+            reason = "btcdom_bearish_reversal_against_alt_short"
+
+        details = {
+            "reason": reason,
+            "btcdom_trend": regime,
+            "btcdom_timeframe": timeframe,
+            "confirmation_candles": required,
+            "btcdom_close": round(float(closed["close"].iloc[-1]), 6),
+        }
+        return reversed_against_position, details
 
     def _check_pullback_long(self, df_15m):
         """
@@ -259,6 +453,8 @@ class SignalEngine:
             "details": {},
             "higher_tf_bias": "neutral",
             "price": 0,
+            "btcdom_bias": "neutral",
+            "market_projection": "balanced",
         }
         
         try:
@@ -271,6 +467,10 @@ class SignalEngine:
             # 1. Macro Trend Anchor (1H)
             macro_trend = self._get_macro_trend(symbol)
             result["higher_tf_bias"] = macro_trend
+
+            btcdom = self._get_btcdom_context()
+            result["btcdom_bias"] = btcdom["trend"]
+            result["market_projection"] = btcdom["projection"]
             
             # 2. Fetch Candle 15m
             df_15m = self.fetch_candles(symbol, config.TRADING_TIMEFRAME)
@@ -294,9 +494,27 @@ class SignalEngine:
             if macro_trend in ("bullish", "neutral"):
                 is_long, score_long, details_long = self._check_pullback_long(df_15m)
                 if is_long:
+                    if (
+                        not self._is_btc_symbol(symbol)
+                        and getattr(config, "BTCDOM_STRICT_ENTRY_FILTER", True)
+                        and btcdom["trend"] == "bullish"
+                    ):
+                        result["details"] = {
+                            "reason": "btcdom_blocks_alt_long",
+                            "btcdom": btcdom,
+                        }
+                        return result
+
                     # Bonus skor jika macro 1H selaras
                     if macro_trend == "bullish":
                         score_long = min(100, score_long + 5)
+                    if not self._is_btc_symbol(symbol) and btcdom["trend"] == "bearish":
+                        score_long = min(
+                            100,
+                            score_long + getattr(config, "BTCDOM_ALIGNED_SCORE_BONUS", 5),
+                        )
+                        details_long["btcdom_confirmation"] = "falling_favors_alt_long"
+                    details_long["btcdom"] = btcdom
                     result["signal"] = "LONG"
                     result["score"] = score_long
                     result["details"] = details_long
@@ -310,6 +528,11 @@ class SignalEngine:
                         min_discount_price = current_close * 0.9985
                         suggested_entry = max(max_discount_price, min(min_discount_price, suggested_entry))
                         result["suggested_entry_price"] = suggested_entry
+
+                    planned_entry = float(result.get("suggested_entry_price") or current_close)
+                    result["initial_stop_plan"] = self.calculate_initial_stop(
+                        symbol, "long", planned_entry, dataframe=df_15m
+                    )
                     
                     logger.info(
                         f"  🎯 TPLR LONG VALIDATED for {symbol} | Score: {score_long} | "
@@ -321,8 +544,26 @@ class SignalEngine:
             if macro_trend in ("bearish", "neutral"):
                 is_short, score_short, details_short = self._check_pullback_short(df_15m)
                 if is_short:
+                    if (
+                        not self._is_btc_symbol(symbol)
+                        and getattr(config, "BTCDOM_STRICT_ENTRY_FILTER", True)
+                        and btcdom["trend"] == "bearish"
+                    ):
+                        result["details"] = {
+                            "reason": "btcdom_blocks_alt_short",
+                            "btcdom": btcdom,
+                        }
+                        return result
+
                     if macro_trend == "bearish":
                         score_short = min(100, score_short + 5)
+                    if not self._is_btc_symbol(symbol) and btcdom["trend"] == "bullish":
+                        score_short = min(
+                            100,
+                            score_short + getattr(config, "BTCDOM_ALIGNED_SCORE_BONUS", 5),
+                        )
+                        details_short["btcdom_confirmation"] = "rising_favors_alt_short"
+                    details_short["btcdom"] = btcdom
                     result["signal"] = "SHORT"
                     result["score"] = score_short
                     result["details"] = details_short
@@ -336,6 +577,11 @@ class SignalEngine:
                         min_premium_price = current_close * 1.0015
                         suggested_entry = min(max_premium_price, max(min_premium_price, suggested_entry))
                         result["suggested_entry_price"] = suggested_entry
+
+                    planned_entry = float(result.get("suggested_entry_price") or current_close)
+                    result["initial_stop_plan"] = self.calculate_initial_stop(
+                        symbol, "short", planned_entry, dataframe=df_15m
+                    )
                     
                     logger.info(
                         f"  🎯 TPLR SHORT VALIDATED for {symbol} | Score: {score_short} | "
@@ -416,7 +662,23 @@ class SignalEngine:
                     result["score"] = 90
                     result["details"] = {"reason": reason, "rsi": round(rsi, 1)}
                     logger.warning(f"⚠️ Confirmed Reversal for SHORT {symbol}: {reason} | RSI: {rsi:.1f}")
-            
+
+            # BTC.D adalah relative-strength filter untuk altcoin saja. Reversal
+            # harga symbol tetap menjadi alasan exit dengan prioritas pertama.
+            if not result["reversed"] and not self._is_btc_symbol(symbol):
+                btcdom_reversed, btcdom_details = self._check_btcdom_exit_reversal(
+                    current_side
+                )
+                if btcdom_reversed:
+                    result["reversed"] = True
+                    result["signal"] = f"CLOSE_{current_side.upper()}_BTCDOM"
+                    result["score"] = 90
+                    result["details"] = btcdom_details
+                    logger.warning(
+                        f"BTC.D reversal confirmed against {current_side.upper()} "
+                        f"{symbol}: {btcdom_details}"
+                    )
+
         except Exception as e:
             logger.error(f"❌ Error checking reversal {symbol}: {e}")
         

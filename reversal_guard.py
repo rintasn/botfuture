@@ -67,10 +67,8 @@ class ReversalGuard:
                 f"{reversal['signal']} | Details: {reversal['details']}"
             )
             
-            # Remove trailing stop dari Binance dulu
-            self.trailing_mgr.remove_stop(symbol)
-            
-            # Close posisi via market order
+            # Market-close dahulu sementara hard-stop exchange tetap aktif.
+            # close_position membersihkan stop hanya setelah close mendapat ACK.
             close_result = self.order_mgr.close_position(
                 symbol=symbol,
                 side=side,

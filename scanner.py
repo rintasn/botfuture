@@ -15,6 +15,16 @@ class MarketScanner:
     
     def __init__(self, exchange):
         self.exchange = exchange
+
+    @staticmethod
+    def _is_crypto_perpetual(market):
+        """Fail-closed: hanya kontrak USD-M dengan metadata underlying crypto."""
+        if not getattr(config, "CRYPTO_ONLY_SCANNER", True):
+            return True
+        info = market.get("info") or {}
+        underlying_type = str(info.get("underlyingType") or "").upper()
+        allowed = {str(v).upper() for v in config.CRYPTO_UNDERLYING_TYPES}
+        return underlying_type in allowed
     
     def scan(self):
         """
@@ -33,6 +43,7 @@ class MarketScanner:
                 if s.endswith(":USDT")
                 and markets[s].get("active", True)
                 and markets[s].get("type") == "swap"
+                and self._is_crypto_perpetual(markets[s])
             ]
             
             # Layer 2: Fetch tickers dan filter by volume

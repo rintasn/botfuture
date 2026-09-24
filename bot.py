@@ -25,6 +25,7 @@ from signal_engine import SignalEngine
 from order_manager import OrderManager
 from trailing_manager import TrailingManager
 from reversal_guard import ReversalGuard
+from user_stream import UserDataStream
 
 
 PID_FILE = "bot.pid"
@@ -72,6 +73,7 @@ class TradingBot:
         self.order_mgr = None
         self.trailing_mgr = None
         self.reversal_guard = None
+        self.user_stream = None
         self._last_cooldown_log = 0
     
     def initialize(self):
@@ -94,16 +96,20 @@ class TradingBot:
             "enableRateLimit": True,
             "options": {
                 "defaultType": "future",
+                # load_markets() tidak perlu memanggil endpoint wallet/currency
+                # SAPI yang membutuhkan permission di luar kebutuhan bot futures.
+                "fetchCurrencies": False,
             },
         }
         
         if config.TRADING_MODE == "testnet":
-            exchange_config["sandbox"] = True
             logger.info("  📋 MODE: TESTNET (paper trading)")
         else:
             logger.info("  💰 MODE: LIVE TRADING")
         
         self.exchange = ccxt.binance(exchange_config)
+        if config.TRADING_MODE == "testnet":
+            self.exchange.set_sandbox_mode(True)
         self.exchange.load_markets()
         logger.info("  ✅ Markets loaded")
         
@@ -122,14 +128,35 @@ class TradingBot:
         logger.info(f"  ⚙️  Leverage: {config.LEVERAGE}x | Margin: {config.MARGIN_MODE}")
         logger.info(f"  ⚙️  Cooldown Global: {config.SIGNAL_COOLDOWN_MINUTES}m | Symbol: {config.SYMBOL_COOLDOWN_MINUTES}m")
         logger.info(f"  ⚙️  Trailing Ratchet: Checkpoint {config.TRAILING_CHECKPOINT_PERCENT}%, Stop {config.TRAILING_FIRST_STOP_PERCENT}%")
-        logger.info(f"  ⚙️  Emergency SL Safety Net: -{config.EMERGENCY_SL_PERCENT}% ({'ON' if config.EMERGENCY_SL_ENABLED else 'OFF'})")
+        logger.info(
+            f"  ⚙️  Adaptive Hard Stop: ATR/EMA55/Swing | "
+            f"Max {config.INITIAL_STOP_MAX_DISTANCE_PERCENT}% | "
+            f"Risk {config.RISK_PER_TRADE_PERCENT}% wallet "
+            f"({'ON' if config.EMERGENCY_SL_ENABLED else 'OFF'})"
+        )
         
         balance = self.order_mgr.get_available_balance()
         logger.info(f"  💰 Available balance: {balance:.2f} USDT")
         
-        # Bersihkan sisa conditional stop orders dari sesi/koin sebelumnya
-        logger.info("🧹 Memeriksa dan membersihkan order conditional sisa...")
-        self.order_mgr.sweep_orphaned_orders()
+        reconciliation = self.order_mgr.reconcile_startup()
+        if reconciliation["status"] != "ok":
+            raise RuntimeError(
+                f"Startup reconciliation gagal; bot tidak boleh trading: "
+                f"{reconciliation.get('error')}"
+            )
+        logger.info(f"  ✅ Reconciliation OK: {reconciliation.get('action')}")
+
+        if self.state.has_position() and not self._ensure_stop_protection():
+            logger.critical("🚨 Posisi belum terproteksi; scanning entry baru dinonaktifkan.")
+
+        if getattr(config, "USER_STREAM_ENABLED", True):
+            self.user_stream = UserDataStream(
+                config.BINANCE_API_KEY,
+                config.BINANCE_API_SECRET,
+                config.TRADING_MODE,
+            )
+            self.user_stream.start()
+            logger.info("  ✅ User-data WebSocket started (orders + positions)")
         
         logger.info("=" * 60)
         
@@ -147,7 +174,11 @@ class TradingBot:
     
     def run(self):
         """Main trading loop."""
-        self.initialize()
+        try:
+            self.initialize()
+        except Exception:
+            remove_pid_file()
+            raise
         self.running = True
         
         logger.info("🚀 Bot started! Entering main loop...\n")
@@ -158,11 +189,20 @@ class TradingBot:
             try:
                 iteration += 1
                 
-                if self.state.has_position():
-                    self._handle_active_position()
-                elif self.state.has_pending_order():
+                self._drain_user_stream()
+
+                # Partial fill dapat membuat position + pending remainder hidup
+                # bersamaan. Remainder selalu ditangani lebih dahulu.
+                had_pending = self.state.has_pending_order()
+                if had_pending:
                     self._handle_pending_order()
-                else:
+
+                # Fill baru sudah memasang hard-stop di _handle_pending_order.
+                # Jangan verifikasi lagi pada iterasi yang sama karena Binance
+                # Algo Order memiliki eventual-consistency beberapa detik.
+                if self.state.has_position() and not had_pending:
+                    self._handle_active_position()
+                elif not self.state.has_pending_order():
                     self._scan_and_trade()
                 
                 time.sleep(config.MAIN_LOOP_INTERVAL)
@@ -175,6 +215,23 @@ class TradingBot:
                 time.sleep(15)
         
         self._shutdown()
+
+    def _drain_user_stream(self):
+        """Consume WS hints; REST checks below remain authoritative."""
+        if not self.user_stream:
+            return
+        for event in self.user_stream.drain():
+            event_type = event.get("type")
+            if event_type == "health":
+                status = event.get("status")
+                if status == "connected":
+                    self.state.set_connection_status("connected")
+                else:
+                    self.state.set_connection_status(
+                        "degraded", event.get("error", "WebSocket disconnected")
+                    )
+            elif event_type in ("orders", "positions"):
+                self.state.mark_websocket_event(event_type)
     
     # =========================================================================
     # Handle Active Position
@@ -190,6 +247,51 @@ class TradingBot:
         side = pos["side"]
         entry_price = pos["entry_price"]
         amount = pos["amount"]
+
+        position_result = self.order_mgr.get_position_status(symbol)
+        if position_result["status"] == "error":
+            logger.error(
+                f"❌ API_ERROR saat verifikasi {symbol}; state posisi dipertahankan dan cycle dipause."
+            )
+            return
+        if position_result["status"] == "empty":
+            logger.warning(
+                f"⚠️ Posisi {symbol} sudah tidak ada di Binance. Sinkronisasi state lokal."
+            )
+            current_price = self.order_mgr.get_current_price(symbol)
+            real_pnl = self.order_mgr.get_realized_pnl(
+                symbol=symbol,
+                side=side,
+                entry_price=entry_price,
+                amount=amount,
+                fallback_close_price=current_price,
+            )
+            self.order_mgr.cancel_all_orders(symbol)
+            self.state.clear_position(
+                pnl=real_pnl,
+                reason="position_closed_on_exchange",
+                start_cooldown=True,
+            )
+            return
+
+        exchange_pos = position_result["position"]
+        if abs(exchange_pos["contracts"] - amount) > 0.0001:
+            logger.warning(
+                f"⚠️ Amount mismatch! State: {amount}, Exchange: {exchange_pos['contracts']}. Syncing..."
+            )
+            self.state.sync_position(
+                symbol,
+                exchange_pos["side"],
+                exchange_pos["entry_price"],
+                exchange_pos["contracts"],
+                order_id=pos.get("order_id"),
+            )
+            pos = self.state.get_position()
+            amount = pos["amount"]
+            entry_price = pos["entry_price"]
+
+        if not self._ensure_stop_protection():
+            return
         
         current_price = self.order_mgr.get_current_price(symbol)
         if current_price <= 0:
@@ -216,39 +318,6 @@ class TradingBot:
             f"Checkpoint: {checkpoint}%"
         )
         
-        exchange_pos = self.order_mgr.fetch_position(symbol)
-        if not exchange_pos or exchange_pos["contracts"] <= 0:
-            logger.warning(
-                f"⚠️ Posisi {symbol} sudah tidak ada di Binance! Closing state & logging PnL..."
-            )
-            real_pnl = self.order_mgr.get_realized_pnl(
-                symbol=symbol,
-                side=side,
-                entry_price=entry_price,
-                amount=amount,
-                fallback_close_price=current_price
-            )
-            
-            self.order_mgr.cancel_all_orders(symbol)
-            self.state.clear_position(
-                pnl=real_pnl,
-                reason="position_closed_on_exchange",
-                start_cooldown=True
-            )
-            logger.info(
-                f"💰 TRADE FINISHED | {side.upper()} {symbol} | Realized PnL: {real_pnl:+.2f} USDT"
-            )
-            return
-        
-        if abs(exchange_pos["contracts"] - amount) > 0.0001:
-            logger.warning(
-                f"⚠️ Amount mismatch! State: {amount}, "
-                f"Exchange: {exchange_pos['contracts']}. Syncing..."
-            )
-            pos["amount"] = exchange_pos["contracts"]
-            amount = exchange_pos["contracts"]
-            self.state.save()
-        
         # Trailing Stop Ratchet Update
         trail_result = self.trailing_mgr.update(
             symbol, entry_price, current_price, side, amount
@@ -256,8 +325,8 @@ class TradingBot:
         
         if trail_result["action"] == "stop_triggered":
             logger.warning("⚠️ Stop triggered detected! Verifying position...")
-            verify_pos = self.order_mgr.fetch_position(symbol)
-            if not verify_pos or verify_pos["contracts"] <= 0:
+            verify_result = self.order_mgr.get_position_status(symbol)
+            if verify_result["status"] == "empty":
                 real_pnl = self.order_mgr.get_realized_pnl(
                     symbol=symbol,
                     side=side,
@@ -269,11 +338,17 @@ class TradingBot:
                 self.state.clear_position(
                     pnl=real_pnl, reason="trailing_stop_triggered", start_cooldown=True
                 )
-                self.order_mgr.sweep_orphaned_orders()
                 logger.info(
                     f"💰 TRADE FINISHED (Trailing Stop) | {side.upper()} {symbol} | "
                     f"Realized PnL: {real_pnl:+.2f} USDT"
                 )
+            elif verify_result["status"] == "error":
+                logger.error("❌ Status posisi sesudah stop tidak diketahui; state dipertahankan.")
+            return
+
+        if trail_result["action"] in ("protection_missing", "protection_unknown"):
+            if trail_result["action"] == "protection_missing":
+                self._ensure_stop_protection()
             return
         
         # Reversal Guard (15m Timeframe)
@@ -307,7 +382,6 @@ class TradingBot:
                             f"⏰ STAGNATION TIMEOUT ({elapsed_hours:.1f}h >= {max_hours}h)! "
                             f"Posisi macet di profit +{profit_pct:.2f}%. Mengamankan profit via market close..."
                         )
-                        self.trailing_mgr.remove_stop(symbol)
                         close_res = self.order_mgr.close_position(
                             symbol=symbol,
                             side=side,
@@ -347,24 +421,30 @@ class TradingBot:
         order_id = order["order_id"]
         timeout_min = order.get("timeout_minutes", config.ORDER_TIMEOUT_MINUTES)
 
+        # Heartbeat exchange-side kill switch. Jika jaringan mati, countdown dan
+        # GTD akan membatalkan remainder tanpa menunggu proses Python pulih.
+        self.order_mgr.refresh_entry_deadman(symbol)
+
         if self.state.is_order_expired():
             logger.info(
                 f"⏰ Limit Order timeout ({timeout_min} min)! "
                 f"Canceling order {order_id} for {symbol}"
             )
-            self.order_mgr.cancel_order(symbol, order_id)
+            cancel_result = self.order_mgr.cancel_order(symbol, order_id)
+            if cancel_result in ("filled", "partial") and self.state.has_position():
+                self._ensure_stop_protection()
             return
         
         status = self.order_mgr.check_order_filled(symbol, order_id)
         
-        if status in ("filled", "partial"):
+        if status in ("filled", "partial", "partial_open"):
             logger.info(
                 f"🎯 Order {'FULLY' if status == 'filled' else 'PARTIALLY'} FILLED! "
                 f"{symbol} @ {order.get('price')}. Starting position monitoring..."
             )
             pos = self.state.get_position()
-            if pos and config.EMERGENCY_SL_ENABLED:
-                self._place_emergency_sl(pos)
+            if pos:
+                self._ensure_stop_protection()
                 
         elif status == "open":
             elapsed = time.time() - order["placed_time"]
@@ -374,23 +454,166 @@ class TradingBot:
                 f"Remaining: {remaining/60:.1f} min"
             )
     
-    def _place_emergency_sl(self, pos):
-        """Pasang emergency stop loss safety net di Binance (-25%)."""
+    def _ensure_stop_protection(self):
+        """Invariant: posisi exchange harus mempunyai stop aktif sebelum dikelola."""
+        pos = self.state.get_position()
+        if not pos:
+            return True
+        if not getattr(config, "MANDATORY_STOP_PROTECTION", True):
+            return True
+
+        stop = self.state.get_trailing_stop()
+        if stop and stop.get("order_id"):
+            in_grace = getattr(
+                self.trailing_mgr, "is_within_verification_grace", lambda _: False
+            )(stop)
+            if in_grace:
+                stop_status = "active"
+            else:
+                stop_status = self.trailing_mgr._verify_stop_order(
+                    pos["symbol"], stop["order_id"]
+                )
+            if stop_status == "active":
+                if (
+                    getattr(config, "STOP_DEDUPLICATION_ENABLED", True)
+                    and not stop.get("deduplicated")
+                    and not in_grace
+                ):
+                    try:
+                        adopted = self.order_mgr.deduplicate_stop_algos(
+                            pos["symbol"], pos["side"], preferred_id=stop["order_id"]
+                        )
+                        if adopted and str(adopted["id"]) != str(stop["order_id"]):
+                            self.state.set_trailing_stop(
+                                adopted["id"], adopted["stop_price"],
+                                stop.get("checkpoint_level", 0),
+                                amount=adopted.get("amount") or pos["amount"],
+                            )
+                            stop = self.state.get_trailing_stop()
+                        self.state.mark_stop_deduplicated()
+                    except Exception as e:
+                        logger.warning(f"⚠️ Deduplikasi stop ditunda: {e}")
+                protected_amount = stop.get("amount")
+
+                # Migrasikan legacy fixed stop yang terlalu jauh. Stop adaptif
+                # dibuat dahulu; legacy stop baru dibatalkan setelah create ACK.
+                stop_price = float(stop.get("stop_price") or 0)
+                stop_distance = (
+                    abs(float(pos["entry_price"]) - stop_price)
+                    / float(pos["entry_price"]) * 100
+                    if stop_price > 0 and float(pos["entry_price"]) > 0
+                    else 0
+                )
+                max_distance = float(
+                    getattr(config, "INITIAL_STOP_MAX_DISTANCE_PERCENT", 5.0)
+                )
+                if (
+                    float(stop.get("checkpoint_level") or 0) == 0
+                    and stop_distance > max_distance + 1e-9
+                ):
+                    logger.warning(
+                        f"⚠️ Legacy stop {stop_distance:.2f}% terlalu jauh; "
+                        f"migrasi ke adaptive stop (max {max_distance:.2f}%)."
+                    )
+                    old_stop_id = stop["order_id"]
+                    if self._place_emergency_sl(pos, fail_close=False):
+                        self.order_mgr.cancel_stop_order(pos["symbol"], old_stop_id)
+                        return True
+                    # Stop legacy tetap aktif; jangan fail-close atau menandai
+                    # posisi unprotected hanya karena tightening gagal.
+                    self.state.set_protection_status("protected")
+                    return True
+
+                if (
+                    protected_amount is not None
+                    and abs(float(protected_amount) - float(pos["amount"])) <= 1e-12
+                ):
+                    self.state.set_protection_status("protected")
+                    return True
+                logger.warning("⚠️ Ukuran stop tidak sama dengan posisi; mengganti stop secara aman.")
+                old_stop_id = stop["order_id"]
+                if self._place_emergency_sl(pos, fail_close=False):
+                    self.order_mgr.cancel_stop_order(pos["symbol"], old_stop_id)
+                    return True
+                self.state.set_protection_status("failed", "Stop tidak mencakup seluruh posisi")
+                if getattr(config, "FAIL_CLOSE_IF_STOP_UNPROTECTED", True):
+                    self.order_mgr.close_position(
+                        pos["symbol"], pos["side"], pos["amount"],
+                        reason="stop_size_mismatch",
+                    )
+                return False
+            if stop_status == "triggered":
+                self.state.set_protection_status("unknown")
+                return False
+            if stop_status == "unknown":
+                # Jangan membuat stop duplikat atau menganggap posisi kosong saat API putus.
+                self.state.set_protection_status("unknown", "Stop status tidak dapat diverifikasi")
+                return False
+
+            # Jika tracked id belum terlihat/ternyata canceled, adopsi stop aktif
+            # lain dan hapus duplikat sebelum membuat order baru.
+            try:
+                adopted = self.order_mgr.deduplicate_stop_algos(
+                    pos["symbol"], pos["side"], preferred_id=stop["order_id"]
+                )
+                if adopted:
+                    self.state.set_trailing_stop(
+                        adopted["id"], adopted["stop_price"],
+                        stop.get("checkpoint_level", 0),
+                        amount=adopted.get("amount") or pos["amount"],
+                    )
+                    return True
+            except Exception as e:
+                self.state.set_protection_status("unknown", e)
+                return False
+            self.state.set_protection_status("missing")
+
+        return self._place_emergency_sl(pos)
+
+    def _place_emergency_sl(self, pos, fail_close=True):
+        """Pasang adaptive exchange hard-stop; fallback dibatasi max distance."""
         symbol = pos["symbol"]
         entry = pos["entry_price"]
         side = pos["side"]
         amount = pos["amount"]
         
-        if side == "long":
-            sl_price = entry * (1 - config.EMERGENCY_SL_PERCENT / 100)
+        plan = pos.get("initial_stop_plan")
+        max_pct = float(getattr(config, "INITIAL_STOP_MAX_DISTANCE_PERCENT", 5.0))
+        plan_valid = bool(plan and float(plan.get("stop_price") or 0) > 0)
+        if plan_valid:
+            plan_distance = abs(entry - float(plan["stop_price"])) / entry * 100
+            plan_valid = (
+                plan_distance <= max_pct + 1e-9
+                and ((side == "long" and float(plan["stop_price"]) < entry)
+                     or (side == "short" and float(plan["stop_price"]) > entry))
+            )
+        if not plan_valid:
+            plan = (
+                self.signal_engine.calculate_initial_stop(symbol, side, entry)
+                if self.signal_engine is not None
+                else None
+            )
+            plan_valid = bool(plan and float(plan.get("stop_price") or 0) > 0)
+
+        if plan_valid:
+            sl_price = float(plan["stop_price"])
+            distance_pct = abs(entry - sl_price) / entry * 100
+            source = plan.get("method", "atr_ema55_swing")
         else:
-            sl_price = entry * (1 + config.EMERGENCY_SL_PERCENT / 100)
+            distance_pct = max_pct
+            sl_price = (
+                entry * (1 - max_pct / 100)
+                if side == "long"
+                else entry * (1 + max_pct / 100)
+            )
+            source = "max_distance_fallback"
             
         logger.info(
-            f"🛡️ Placing Emergency Safety SL for {symbol} at {sl_price:.4f} "
-            f"(-{config.EMERGENCY_SL_PERCENT}%)"
+            f"🛡️ Placing adaptive hard-stop for {symbol} at {sl_price:.8f} "
+            f"({distance_pct:.2f}% from entry | {source})"
         )
         
+        self.state.set_protection_status("pending")
         stop_order = self.order_mgr.place_stop_order(
             symbol=symbol,
             side=side,
@@ -403,10 +626,24 @@ class TradingBot:
                 stop_order_id=stop_order["id"],
                 stop_price=sl_price,
                 checkpoint_level=0,
+                amount=amount,
             )
             logger.info(f"✅ Emergency SL active on Binance! ID: {stop_order['id']}")
+            return True
         else:
             logger.error(f"❌ Gagal pasang emergency SL untuk {symbol}")
+            self.state.set_protection_status("failed", "Gagal memasang emergency stop")
+            if fail_close and getattr(config, "FAIL_CLOSE_IF_STOP_UNPROTECTED", True):
+                logger.critical(
+                    f"🚨 FAIL-CLOSE: mencoba menutup {symbol} karena posisi tanpa stop."
+                )
+                self.order_mgr.close_position(
+                    symbol=symbol,
+                    side=side,
+                    amount=amount,
+                    reason="stop_protection_failed",
+                )
+            return False
 
     # =========================================================================
     # Scan & Trade
@@ -474,6 +711,8 @@ class TradingBot:
                 f"🚀 ENTRY SIGNAL: {signal} {symbol}\n"
                 f"   Score: {score}/100 | Price: {price}\n"
                 f"   HTF Bias 1H: {best_signal['higher_tf_bias']}\n"
+                f"   BTC.D Bias: {best_signal.get('btcdom_bias', 'neutral')} | "
+                f"Projection: {best_signal.get('market_projection', 'balanced')}\n"
                 f"   Details: {best_signal['details']}\n"
                 f"{'='*50}"
             )
@@ -487,6 +726,7 @@ class TradingBot:
                 current_price=price,
                 score=score,
                 suggested_price=suggested_p,
+                initial_stop_plan=best_signal.get("initial_stop_plan"),
             )
             
             if order:
@@ -502,6 +742,8 @@ class TradingBot:
     
     def _shutdown(self):
         """Graceful shutdown."""
+        if self.user_stream:
+            self.user_stream.stop()
         remove_pid_file()
         logger.info("\n" + "=" * 60)
         logger.info("🛑 Bot shutting down...")

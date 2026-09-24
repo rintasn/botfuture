@@ -269,6 +269,14 @@ DASHBOARD_HTML = """
                     <div class="stat-label">Mode</div>
                     <div class="stat-value neutral" id="mode">-</div>
                 </div>
+                <div class="stat-item">
+                    <div class="stat-label">Connection</div>
+                    <div class="stat-value neutral" id="connectionStatus">-</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Stop Protection</div>
+                    <div class="stat-value neutral" id="protectionStatus">-</div>
+                </div>
             </div>
         </div>
         
@@ -289,7 +297,7 @@ DASHBOARD_HTML = """
                     <div class="stat-value neutral" id="checkpoint">-</div>
                 </div>
                 <div class="stat-item">
-                    <div class="stat-label">Emergency SL</div>
+                    <div class="stat-label">Adaptive Hard SL</div>
                     <div class="stat-value" id="emergencySL">-</div>
                 </div>
             </div>
@@ -361,6 +369,16 @@ DASHBOARD_HTML = """
             document.getElementById('uptime').textContent = state.start_time ? 
                 new Date(state.start_time).toLocaleDateString() : '-';
             document.getElementById('mode').textContent = '{{ mode }}';
+            const connection = state.connection_status || 'unknown';
+            const connectionEl = document.getElementById('connectionStatus');
+            connectionEl.textContent = connection.toUpperCase();
+            connectionEl.className = 'stat-value ' + (connection === 'connected' ? 'positive' : 'negative');
+            const protection = state.protection_status || 'none';
+            const protectionEl = document.getElementById('protectionStatus');
+            protectionEl.textContent = protection.toUpperCase();
+            protectionEl.className = 'stat-value ' + (
+                protection === 'protected' || protection === 'none' ? 'positive' : 'negative'
+            );
             
             // Config
             document.getElementById('leverage').textContent = '{{ leverage }}x';
@@ -461,6 +479,14 @@ DASHBOARD_HTML = """
                             <div class="stat-value neutral">${sig.score || '-'}/100</div>
                         </div>
                         <div class="stat-item">
+                            <div class="stat-label">BTC.D Bias</div>
+                            <div class="stat-value neutral">${(sig.btcdom_bias || 'neutral').toUpperCase()}</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-label">Market Projection</div>
+                            <div class="stat-value neutral" style="font-size:0.85rem">${sig.market_projection || 'balanced'}</div>
+                        </div>
+                        <div class="stat-item">
                             <div class="stat-label">Time</div>
                             <div class="stat-value neutral" style="font-size:0.85rem">${sig.time ? new Date(sig.time).toLocaleString() : '-'}</div>
                         </div>
@@ -519,7 +545,11 @@ def index():
         leverage=config.LEVERAGE,
         entry_offset=f"{config.HIGH_CONVICTION_OFFSET_PERCENT}% / {config.NORMAL_CONVICTION_OFFSET_PERCENT}%",
         checkpoint=config.TRAILING_CHECKPOINT_PERCENT,
-        emergency_sl=f"-{config.EMERGENCY_SL_PERCENT}%" if config.EMERGENCY_SL_ENABLED else "OFF",
+        emergency_sl=(
+            f"{config.INITIAL_STOP_MIN_DISTANCE_PERCENT}%–"
+            f"{config.INITIAL_STOP_MAX_DISTANCE_PERCENT}%"
+            if config.EMERGENCY_SL_ENABLED else "OFF"
+        ),
     )
 
 

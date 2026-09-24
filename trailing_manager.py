@@ -1,19 +1,7 @@
-"""
-Trailing Stop Manager
-=====================
-Mengelola trailing stop dengan sistem Pro Breathing Room Ratchet.
-
-Mekanisme:
-- Entry: Emergency Stop Loss di -25% (safety net anti-likuidasi).
-- Profit +5.0% → Kunci BEP (+0.5%) dengan ruang napas 4.5% agar tidak gampang kejilat.
-- Profit +8.0% → Geser stop ke +4.0% (mulai amankan profit bersih).
-- Profit +11.0% → Geser stop ke +7.0%.
-- Profit +14.0% → Geser stop ke +10.0%.
-- Tiap kenaikan +3.0% → Stop digeser naik +3.0% (selalu beri 4.0% breathing room).
-- Instan Jump: Jika harga melonjak tiba-tiba (misal ke +20%), stop langsung lompat ke level tertinggi (+16%) dalam 1 order.
-"""
+"""Pengelola adaptive hard-stop, BEP, dan stepped trailing ratchet."""
 
 from datetime import datetime
+import ccxt
 import config
 from logger_setup import logger
 
@@ -41,13 +29,24 @@ class TrailingManager:
             return entry_price * (1 + stop_profit_pct / 100)
         else:
             return entry_price * (1 - stop_profit_pct / 100)
+
+    def is_within_verification_grace(self, stop_info):
+        """Percayai ACK create sampai Algo Order konsisten di endpoint query."""
+        if not stop_info or not stop_info.get("set_time"):
+            return False
+        try:
+            set_time = datetime.fromisoformat(stop_info["set_time"])
+            age = (datetime.now() - set_time).total_seconds()
+            return age < float(getattr(config, "STOP_VERIFICATION_GRACE_SECONDS", 8))
+        except (TypeError, ValueError):
+            return False
     
     def get_stop_level_for_checkpoint(self, checkpoint):
         """
         Tentukan level stop profit berdasarkan checkpoint.
-        - Checkpoint 5.0% → Stop di 0.5% (BEP + cover fee)
-        - Checkpoint 8.0% → Stop di 4.0%
-        - Checkpoint 11.0% → Stop di 7.0%
+        - Checkpoint 2.0% → Stop di +0.3% (BEP + cover fee)
+        - Checkpoint 3.5% → Stop di +1.5%
+        - Checkpoint 5.0% → Stop di +3.0%
         - dst...
         """
         first_cp = getattr(config, "TRAILING_FIRST_CHECKPOINT_PERCENT", 5.0)
@@ -91,26 +90,29 @@ class TrailingManager:
         self.state.update_highest_profit(profit_pct)
         pos = self.state.get_position() or {}
         
-        # 1. Emergency SL Check
-        if config.EMERGENCY_SL_ENABLED and profit_pct <= -config.EMERGENCY_SL_PERCENT:
-            logger.critical(
-                f"🚨 EMERGENCY STOP LOSS! {symbol} | "
-                f"Profit: {profit_pct:.2f}% | "
-                f"Threshold: -{config.EMERGENCY_SL_PERCENT}%"
-            )
-            result["action"] = "emergency_sl"
-            return result
-        
-        # 2. Cek apakah stop order lama masih ada di exchange
+        # Cek apakah hard-stop lama masih ada di exchange.
         old_stop = self.state.get_trailing_stop()
         if old_stop and old_stop.get("order_id"):
-            stop_status = self._verify_stop_order(symbol, old_stop["order_id"])
+            if self.is_within_verification_grace(old_stop):
+                stop_status = "active"
+            else:
+                stop_status = self._verify_stop_order(symbol, old_stop["order_id"])
             if stop_status == "triggered":
                 logger.warning(
                     f"⚠️ Trailing stop {old_stop['order_id']} sudah TRIGGERED! "
                     f"Posisi kemungkinan sudah ter-close oleh Binance."
                 )
                 result["action"] = "stop_triggered"
+                return result
+            if stop_status in ("canceled", "not_found"):
+                logger.critical(f"🚨 Stop protection {old_stop['order_id']} tidak aktif!")
+                self.state.set_protection_status("missing")
+                result["action"] = "protection_missing"
+                return result
+            if stop_status == "unknown":
+                logger.warning("⚠️ Status stop tidak dapat diverifikasi; pengelolaan posisi dipause.")
+                self.state.set_protection_status("unknown")
+                result["action"] = "protection_unknown"
                 return result
         
         # 3. Hitung checkpoint tertinggi yang sudah tercapai
@@ -142,17 +144,7 @@ class TrailingManager:
                     f"Stop Price: {stop_price}"
                 )
                 
-                # Cancel stop order lama
-                if old_stop and old_stop.get("order_id"):
-                    cancel_result = self.order_mgr.cancel_stop_order(
-                        symbol, old_stop["order_id"]
-                    )
-                    if cancel_result == "triggered":
-                        logger.warning("⚠️ Old stop already triggered during checkpoint update!")
-                        result["action"] = "stop_triggered"
-                        return result
-                
-                # Place stop order baru di Binance langsung di level tertinggi
+                # Place-before-cancel: posisi tidak pernah melewati celah tanpa stop.
                 stop_order = self.order_mgr.place_stop_order(
                     symbol=symbol,
                     side=side,
@@ -161,10 +153,19 @@ class TrailingManager:
                 )
                 
                 if stop_order:
+                    if old_stop and old_stop.get("order_id"):
+                        cancel_result = self.order_mgr.cancel_stop_order(symbol, old_stop["order_id"])
+                        if cancel_result == "triggered":
+                            self.order_mgr.cancel_stop_order(symbol, stop_order["id"])
+                            result["action"] = "stop_triggered"
+                            return result
+                        if cancel_result == "error":
+                            logger.warning("⚠️ Stop lama belum terhapus; dua reduce-only stop sementara aktif.")
                     self.state.set_trailing_stop(
                         stop_order_id=stop_order["id"],
                         stop_price=stop_price,
                         checkpoint_level=highest_cp,
+                        amount=amount,
                     )
                     
                     result["action"] = "new_stop" if current_checkpoint == 0 else "update_stop"
@@ -227,15 +228,6 @@ class TrailingManager:
                             f"Peak/Now Profit: +{eff_profit:.2f}% >= {tier_req_profit}% | "
                             f"Ratcheting Stop to: +{target_stop_pct}% (Price: {target_stop_price})"
                         )
-                        if old_stop and old_stop.get("order_id"):
-                            cancel_result = self.order_mgr.cancel_stop_order(
-                                symbol, old_stop["order_id"]
-                            )
-                            if cancel_result == "triggered":
-                                logger.warning("⚠️ Old stop already triggered during progressive lock!")
-                                result["action"] = "stop_triggered"
-                                return result
-                                
                         stop_order = self.order_mgr.place_stop_order(
                             symbol=symbol,
                             side=side,
@@ -243,11 +235,20 @@ class TrailingManager:
                             stop_price=target_stop_price,
                         )
                         if stop_order:
+                            if old_stop and old_stop.get("order_id"):
+                                cancel_result = self.order_mgr.cancel_stop_order(symbol, old_stop["order_id"])
+                                if cancel_result == "triggered":
+                                    self.order_mgr.cancel_stop_order(symbol, stop_order["id"])
+                                    result["action"] = "stop_triggered"
+                                    return result
+                                if cancel_result == "error":
+                                    logger.warning("⚠️ Stop lama belum terhapus; dua reduce-only stop sementara aktif.")
                             effective_cp = max(current_checkpoint, highest_cp)
                             self.state.set_trailing_stop(
                                 stop_order_id=stop_order["id"],
                                 stop_price=target_stop_price,
                                 checkpoint_level=effective_cp,
+                                amount=amount,
                             )
                             result["action"] = "progressive_lock"
                             result["checkpoint"] = effective_cp
@@ -293,15 +294,6 @@ class TrailingManager:
                             f"Peak profit: +{highest_p:.2f}% (Now: {profit_pct:+.2f}%) | "
                             f"Locking Stop Level: +{bep_stop_level}% (BEP Price: {bep_stop_price})"
                         )
-                        if old_stop and old_stop.get("order_id"):
-                            cancel_result = self.order_mgr.cancel_stop_order(
-                                symbol, old_stop["order_id"]
-                            )
-                            if cancel_result == "triggered":
-                                logger.warning("⚠️ Old stop already triggered during BEP lock!")
-                                result["action"] = "stop_triggered"
-                                return result
-                        
                         stop_order = self.order_mgr.place_stop_order(
                             symbol=symbol,
                             side=side,
@@ -309,10 +301,19 @@ class TrailingManager:
                             stop_price=bep_stop_price,
                         )
                         if stop_order:
+                            if old_stop and old_stop.get("order_id"):
+                                cancel_result = self.order_mgr.cancel_stop_order(symbol, old_stop["order_id"])
+                                if cancel_result == "triggered":
+                                    self.order_mgr.cancel_stop_order(symbol, stop_order["id"])
+                                    result["action"] = "stop_triggered"
+                                    return result
+                                if cancel_result == "error":
+                                    logger.warning("⚠️ Stop lama belum terhapus; dua reduce-only stop sementara aktif.")
                             self.state.set_trailing_stop(
                                 stop_order_id=stop_order["id"],
                                 stop_price=bep_stop_price,
                                 checkpoint_level=0.5,
+                                amount=amount,
                             )
                             result["action"] = "bep_locked"
                             result["checkpoint"] = 0.5
@@ -341,8 +342,19 @@ class TrailingManager:
                     return "active"
                 elif status in ("CANCELLED", "EXPIRED", "REJECTED"):
                     return "canceled"
-        except Exception:
+        except ccxt.OrderNotFound:
             pass
+        except ccxt.NetworkError as e:
+            logger.warning(f"⚠️ Network error saat verifikasi algo stop {order_id}: {e}")
+            return "unknown"
+        except ccxt.ExchangeError as e:
+            message = str(e).lower()
+            if "not found" not in message and "does not exist" not in message and "-2013" not in message:
+                logger.warning(f"⚠️ Exchange error saat verifikasi algo stop {order_id}: {e}")
+                return "unknown"
+        except Exception as e:
+            logger.warning(f"⚠️ Error saat verifikasi algo stop {order_id}: {e}")
+            return "unknown"
 
         # 2. Fallback regular order API
         try:
@@ -357,8 +369,11 @@ class TrailingManager:
                 return "canceled"
             else:
                 return status
-        except Exception:
-            return "active"
+        except ccxt.OrderNotFound:
+            return "not_found"
+        except Exception as e:
+            logger.warning(f"⚠️ Gagal verifikasi stop {order_id}: {e}")
+            return "unknown"
     
     def remove_stop(self, symbol):
         """Remove trailing stop order dari Binance saat manual / reversal exit."""

@@ -21,7 +21,7 @@ TRADING_MODE = os.getenv("TRADING_MODE", "testnet")  # 'live' atau 'testnet'
 # =============================================================================
 LEVERAGE = 3                    # Leverage 3x
 MARGIN_MODE = "isolated"        # Isolated margin (lebih aman per posisi)
-BALANCE_USAGE = 0.90            # Gunakan 90% balance (sisakan 10% buffer)
+BALANCE_USAGE = 0.35            # Gunakan 35% balance (sisakan 65% buffer)
 MAX_POSITIONS = 1               # Hanya 1 posisi aktif
 MIN_WALLET_BALANCE_USDT = 5.0   # Saldo minimum untuk bot mulai trading
 
@@ -51,6 +51,16 @@ NORMAL_CONVICTION_TIMEOUT_MINUTES = 15  # Timeout 15 menit
 ENTRY_OFFSET_PERCENT = 0.35             # Default limit offset
 ORDER_TIMEOUT_MINUTES = 15              # Default timeout
 ORDER_CHECK_INTERVAL = 10               # Cek order setiap 10 detik
+
+# Exchange-side expiry + kill switch untuk pending entry. GTD tetap bekerja
+# ketika proses bot/laptop mati; countdownCancelAll diperbarui selama entry
+# masih pending dan hanya dipasang pada simbol entry tersebut.
+ENTRY_GTD_ENABLED = True
+ENTRY_GTD_GRACE_SECONDS = 15             # Binance mensyaratkan GTD > now + 600 detik
+ENTRY_DEADMAN_ENABLED = True
+ENTRY_DEADMAN_COUNTDOWN_MS = 120_000     # Rekomendasi Binance: 120 detik
+ENTRY_DEADMAN_REFRESH_SECONDS = 30
+BOT_ORDER_CLIENT_PREFIX = "bf_"
 
 # =============================================================================
 # PRO TRAILING STOP CONFIGURATION (Sweet Spot Breathing Room Ratchet)
@@ -99,10 +109,32 @@ ESTIMATED_ROUNDTRIP_FEE_PERCENT = 0.08      # Estimasi total fee round-trip Bina
 TRAILING_CHECKPOINT_PERCENT = 2.0
 
 # =============================================================================
-# EMERGENCY STOP LOSS (Safety Net - Anti Likuidasi)
+# ADAPTIVE INITIAL HARD STOP & RISK CAP
 # =============================================================================
-EMERGENCY_SL_ENABLED = True         # Safety net aktif (jauh agar tidak kejilat wick)
-EMERGENCY_SL_PERCENT = 25.0         # Pasang di -25% (sebelum likuidasi leverage 3x ~33%)
+# Stop awal tetap berada di Binance agar posisi terlindungi ketika bot/laptop
+# offline. Level dasarnya mengikuti struktur 15m (EMA55 + swing + ATR buffer),
+# lalu dijepit agar tidak terlalu dekat maupun terlalu jauh dari entry.
+EMERGENCY_SL_ENABLED = True
+INITIAL_STOP_ATR_MULTIPLIER = 1.5
+INITIAL_STOP_ATR_BUFFER = 0.25
+INITIAL_STOP_SWING_LOOKBACK = 20
+INITIAL_STOP_MIN_DISTANCE_PERCENT = 1.0
+INITIAL_STOP_MAX_DISTANCE_PERCENT = 5.0
+
+# Maksimum kerugian teoritis pada initial stop, dalam persen dari available
+# wallet. Notional tetap dibatasi juga oleh BALANCE_USAGE x LEVERAGE.
+RISK_PER_TRADE_PERCENT = 1.0
+
+# Alias kompatibilitas untuk kode/state lama. Nilainya sekarang adalah batas
+# maksimum adaptive stop, bukan fixed stop yang selalu dipakai.
+EMERGENCY_SL_PERCENT = INITIAL_STOP_MAX_DISTANCE_PERCENT
+MANDATORY_STOP_PROTECTION = True
+FAIL_CLOSE_IF_STOP_UNPROTECTED = True
+
+# Binance Algo Order dapat belum terlihat sesaat setelah create berhasil.
+# Selama grace period ini order dianggap aktif berdasarkan ACK exchange.
+STOP_VERIFICATION_GRACE_SECONDS = 8
+STOP_DEDUPLICATION_ENABLED = True
 
 # =============================================================================
 # SIGNAL ENGINE SETTINGS (Institutional TPLR)
@@ -140,11 +172,28 @@ HIGHER_TIMEFRAME = "1h"         # Timeframe konfirmasi trend makro (1h)
 CANDLE_HISTORY_CONFIRMATION_COUNT = 3
 
 # =============================================================================
+# BTC DOMINANCE MARKET REGIME FILTER
+# =============================================================================
+# BTCDOMUSDT menjadi proxy relative strength BTC terhadap altcoin besar.
+# Filter ini hanya mengatur entry/exit altcoin, bukan arah absolut harga BTC.
+BTCDOM_FILTER_ENABLED = True
+BTCDOM_SYMBOL = "BTCDOM/USDT:USDT"
+BTCDOM_TIMEFRAME = "1h"
+BTCDOM_EXIT_TIMEFRAME = "15m"
+BTCDOM_CACHE_SECONDS = 60
+BTCDOM_STRICT_ENTRY_FILTER = True
+BTCDOM_ALIGNED_SCORE_BONUS = 5
+BTCDOM_EXIT_ON_REVERSAL = True
+BTCDOM_EXIT_CONFIRMATION_CANDLES = 2
+
+# =============================================================================
 # SCANNER SETTINGS
 # =============================================================================
 SCANNER_TOP_N = 50              # Scan top 50 koin berdasarkan volume
 MIN_24H_CHANGE_PERCENT = 1.0    # Minimum perubahan harga 24h (absolute)
 MAX_SPREAD_PERCENT = 0.05       # Maximum spread yang diperbolehkan
+CRYPTO_ONLY_SCANNER = True
+CRYPTO_UNDERLYING_TYPES = ("COIN",)  # Binance USD-M metadata; TradFi/index ditolak
 
 # Blacklist koin (stablecoins, TradFi perps, low liquidity, dll)
 BLACKLIST_COINS = [
@@ -156,7 +205,9 @@ BLACKLIST_COINS = [
     "SOXL/USDT", "MU/USDT", "AKE/USDT", "MSTR/USDT",
     "XAU/USDT", "AIN/USDT", "KORU/USDT", "SPCX/USDT",
     "SKHY/USDT", "SNXX/USDT", "POWER/USDT", "PONS/USDT",
-    "CRCL/USDT", "BR/USDT", "BZ/USDT",
+    "CRCL/USDT", "BR/USDT", "BZ/USDT", "XAG/USDT",
+    # Market regime index (filter only, tidak ditradingkan oleh bot)
+    "BTCDOM/USDT",
 ]
 
 # =============================================================================
@@ -186,3 +237,7 @@ STATE_FILE = "bot_state.json"
 # =============================================================================
 MAIN_LOOP_INTERVAL = 10         # Sleep 10 detik antar iterasi
 CANDLE_FETCH_LIMIT = 250        # Jumlah candle yang di-fetch untuk analisis
+
+# User-data WebSocket (CCXT Pro tersedia di paket ccxt yang sama).
+USER_STREAM_ENABLED = True
+USER_STREAM_RECONNECT_MAX_SECONDS = 30

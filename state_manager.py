@@ -8,6 +8,9 @@ Memungkinkan recovery setelah restart tanpa kehilangan informasi posisi.
 import os
 import json
 import time
+import copy
+import tempfile
+import threading
 from datetime import datetime, timedelta
 from logger_setup import logger
 import config
@@ -18,6 +21,7 @@ class StateManager:
     
     def __init__(self, state_file=None):
         self.state_file = state_file or config.STATE_FILE
+        self._lock = threading.RLock()
         self.state = self._load_state()
     
     def _default_state(self):
@@ -37,6 +41,11 @@ class StateManager:
             "cooldown_until": 0,                 # Timestamp berakhirnya cooldown global
             "symbol_cooldowns": {},              # Timestamp cooldown per simbol {symbol: timestamp}
             "start_time": datetime.now().isoformat(),
+            "protection_status": "none",       # none, pending, protected, missing, unknown, failed
+            "connection_status": "starting",  # starting, connected, degraded, api_error
+            "last_api_error": None,
+            "last_reconciliation": None,
+            "last_websocket_event": None,
         }
     
     def _load_state(self):
@@ -60,12 +69,35 @@ class StateManager:
         return self._default_state()
     
     def save(self):
-        """Simpan state ke file JSON."""
+        """Simpan state secara atomic agar JSON tidak pernah terbaca setengah."""
+        temp_path = None
         try:
-            with open(self.state_file, "w") as f:
-                json.dump(self.state, f, indent=2, default=str)
-        except IOError as e:
+            with self._lock:
+                target = os.path.abspath(self.state_file)
+                parent = os.path.dirname(target) or os.getcwd()
+                os.makedirs(parent, exist_ok=True)
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=parent,
+                    prefix=f".{os.path.basename(target)}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as tmp:
+                    temp_path = tmp.name
+                    json.dump(self.state, tmp, indent=2, default=str)
+                    tmp.flush()
+                    os.fsync(tmp.fileno())
+                os.replace(temp_path, target)
+                temp_path = None
+        except (IOError, OSError) as e:
             logger.error(f"❌ Gagal simpan state: {e}")
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
     
     # =========================================================================
     # Cooldown & Protection Management
@@ -162,7 +194,10 @@ class StateManager:
     # Position Management
     # =========================================================================
     
-    def set_position(self, symbol, side, entry_price, amount, order_id):
+    def set_position(
+        self, symbol, side, entry_price, amount, order_id, entry_time=None,
+        initial_stop_plan=None,
+    ):
         """Simpan info posisi aktif."""
         self.state["active_position"] = {
             "symbol": symbol,
@@ -170,19 +205,23 @@ class StateManager:
             "entry_price": entry_price,
             "amount": amount,
             "order_id": order_id,
-            "entry_time": datetime.now().isoformat(),
+            "entry_time": entry_time or datetime.now().isoformat(),
             "highest_profit_pct": 0.0,
+            "initial_stop_plan": copy.deepcopy(initial_stop_plan),
         }
+        self.state["trailing_stop"] = None
+        self.state["current_checkpoint"] = 0
         self.state["bot_status"] = "monitoring"
+        self.state["protection_status"] = "pending"
         self.save()
         logger.info(f"📊 Position saved: {side.upper()} {symbol} @ {entry_price}")
     
-    def clear_position(self, pnl=0.0, reason="", start_cooldown=True):
+    def clear_position(self, pnl=0.0, reason="", start_cooldown=True, record_history=True):
         """Hapus posisi aktif, catat ke history, dan update statistik."""
         pos = self.state["active_position"]
         symbol = pos["symbol"] if pos else None
         
-        if pos:
+        if pos and record_history:
             trade_record = {
                 **pos,
                 "close_time": datetime.now().isoformat(),
@@ -207,6 +246,7 @@ class StateManager:
         self.state["active_position"] = None
         self.state["trailing_stop"] = None
         self.state["current_checkpoint"] = 0
+        self.state["protection_status"] = "none"
         self.state["bot_status"] = "idle"
         self.save()
         logger.info(f"🔄 Position cleared. Reason: {reason}, PnL: {pnl:+.2f} USDT")
@@ -226,7 +266,11 @@ class StateManager:
     # Pending Order Management
     # =========================================================================
     
-    def set_pending_order(self, symbol, side, price, amount, order_id, timeout_minutes=None):
+    def set_pending_order(
+        self, symbol, side, price, amount, order_id, timeout_minutes=None,
+        client_order_id=None, good_till_date=None, status_unknown=False,
+        initial_stop_plan=None,
+    ):
         """Simpan info pending limit order."""
         if timeout_minutes is None:
             timeout_minutes = config.ORDER_TIMEOUT_MINUTES
@@ -240,6 +284,11 @@ class StateManager:
             "placed_time": time.time(),
             "placed_time_str": datetime.now().isoformat(),
             "timeout_minutes": timeout_minutes,
+            "client_order_id": client_order_id,
+            "good_till_date": good_till_date,
+            "status_unknown": bool(status_unknown),
+            "last_deadman_refresh": 0,
+            "initial_stop_plan": copy.deepcopy(initial_stop_plan),
         }
         self.state["bot_status"] = "waiting_fill"
         self.save()
@@ -251,7 +300,7 @@ class StateManager:
     def clear_pending_order(self, start_cooldown=False, symbol=None):
         """Hapus pending order."""
         self.state["pending_order"] = None
-        self.state["bot_status"] = "idle"
+        self.state["bot_status"] = "monitoring" if self.state.get("active_position") else "idle"
         self.save()
         if start_cooldown:
             # Cooldown ringan jika order timeout/cancel (hanya jeda singkat sebelum scan koin lain)
@@ -284,15 +333,18 @@ class StateManager:
     # Trailing Stop Management
     # =========================================================================
     
-    def set_trailing_stop(self, stop_order_id, stop_price, checkpoint_level):
+    def set_trailing_stop(self, stop_order_id, stop_price, checkpoint_level, amount=None):
         """Simpan info trailing stop aktif."""
         self.state["trailing_stop"] = {
             "order_id": stop_order_id,
             "stop_price": stop_price,
             "checkpoint_level": checkpoint_level,
+            "amount": amount,
             "set_time": datetime.now().isoformat(),
+            "deduplicated": False,
         }
         self.state["current_checkpoint"] = checkpoint_level
+        self.state["protection_status"] = "protected"
         self.save()
         logger.info(
             f"🛡️ Trailing stop saved: checkpoint {checkpoint_level}%, "
@@ -306,6 +358,12 @@ class StateManager:
     def get_current_checkpoint(self):
         """Ambil level checkpoint saat ini."""
         return self.state["current_checkpoint"]
+
+    def mark_stop_deduplicated(self):
+        stop = self.state.get("trailing_stop")
+        if stop and not stop.get("deduplicated"):
+            stop["deduplicated"] = True
+            self.save()
     
     # =========================================================================
     # Signal & Misc
@@ -323,10 +381,80 @@ class StateManager:
         """Update status bot."""
         self.state["bot_status"] = status
         self.save()
+
+    def set_protection_status(self, status, error=None):
+        """Catat invariant proteksi posisi secara eksplisit."""
+        if self.state.get("protection_status") == status and not error:
+            return
+        self.state["protection_status"] = status
+        if error:
+            self.state["last_api_error"] = {
+                "time": datetime.now().isoformat(),
+                "message": str(error),
+            }
+        self.save()
+
+    def set_connection_status(self, status, error=None):
+        """Catat kesehatan REST/WebSocket tanpa mengubah state posisi."""
+        if (
+            self.state.get("connection_status") == status
+            and not error
+            and not self.state.get("last_api_error")
+        ):
+            return
+        self.state["connection_status"] = status
+        if error:
+            self.state["last_api_error"] = {
+                "time": datetime.now().isoformat(),
+                "message": str(error),
+            }
+        elif status == "connected":
+            self.state["last_api_error"] = None
+        self.save()
+
+    def mark_reconciled(self, result):
+        self.state["last_reconciliation"] = {
+            "time": datetime.now().isoformat(),
+            "result": result,
+        }
+        self.save()
+
+    def mark_websocket_event(self, event_type, status="connected"):
+        self.state["last_websocket_event"] = {
+            "time": datetime.now().isoformat(),
+            "type": event_type,
+        }
+        self.state["connection_status"] = status
+        self.save()
+
+    def sync_position(
+        self, symbol, side, entry_price, amount, order_id="synced_from_exchange",
+        initial_stop_plan=None,
+    ):
+        """Sinkronkan ukuran posisi tanpa mereset umur posisi yang sama."""
+        current = self.state.get("active_position")
+        if current and current.get("symbol") == symbol and current.get("side") == side:
+            amount_changed = abs(float(current.get("amount", 0)) - float(amount)) > 1e-12
+            current["entry_price"] = float(entry_price)
+            current["amount"] = float(amount)
+            if order_id:
+                current["order_id"] = order_id
+            if amount_changed:
+                self.state["protection_status"] = "pending"
+            if initial_stop_plan is not None:
+                current["initial_stop_plan"] = copy.deepcopy(initial_stop_plan)
+            self.state["bot_status"] = "monitoring"
+            self.save()
+            return
+        self.set_position(
+            symbol, side, entry_price, amount, order_id,
+            initial_stop_plan=initial_stop_plan,
+        )
     
     def get_state(self):
         """Ambil seluruh state (untuk dashboard)."""
-        return self.state.copy()
+        with self._lock:
+            return copy.deepcopy(self.state)
     
     def update_highest_profit(self, profit_pct):
         """Update highest profit yang pernah dicapai posisi ini."""
