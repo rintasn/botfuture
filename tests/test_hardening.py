@@ -151,10 +151,13 @@ class HardeningTests(unittest.TestCase):
                 return {
                     symbol: {
                         "symbol": symbol, "quoteVolume": 2_000_000_000,
-                        "percentage": 2, "bid": 100, "ask": 100.01, "last": 100,
+                        "percentage": 2, "last": 100,
                     }
                     for symbol in symbols
                 }
+
+            def fetch_bids_asks(self, symbols):
+                return {symbol: {"bid": 100, "ask": 100.01} for symbol in symbols}
 
         candidates = MarketScanner(Exchange()).scan()
         self.assertEqual([item["symbol"] for item in candidates], ["BTC/USDT:USDT"])
@@ -174,14 +177,56 @@ class HardeningTests(unittest.TestCase):
                     symbol: {
                         "symbol": symbol,
                         "quoteVolume": 1_000_000 if symbol.startswith("THIN") else 20_000_000,
-                        "percentage": 3, "bid": None if symbol.startswith("NOBID") else 100,
-                        "ask": 100.01, "last": 100,
+                        "percentage": 3, "last": 100,
+                    }
+                    for symbol in symbols
+                }
+
+            def fetch_bids_asks(self, symbols):
+                return {
+                    symbol: {
+                        "bid": None if symbol.startswith("NOBID") else 100,
+                        "ask": 100.01,
                     }
                     for symbol in symbols
                 }
 
         candidates = MarketScanner(Exchange()).scan()
         self.assertEqual([item["symbol"] for item in candidates], ["BTC/USDT:USDT"])
+
+    def test_bot_publishes_scan_decisions_without_placing_order(self):
+        class Scanner:
+            def scan(self):
+                return [{
+                    "symbol": "ETH/USDT:USDT", "price": 100,
+                    "quote_volume": 30_000_000, "spread_pct": .01,
+                    "change_24h": 2, "scan_score": 70,
+                }]
+
+        class Signal:
+            def analyze(self, symbol):
+                return {
+                    "signal": "WAIT", "score": 0, "price": 100,
+                    "details": {"reason": "btc_regime_neutral_alt_entry_paused"},
+                    "higher_tf_bias": "bullish", "btc_market_bias": "neutral",
+                    "btcdom_bias": "neutral",
+                }
+
+        class Orders:
+            def get_available_balance(self):
+                return 100
+
+        bot = TradingBot()
+        bot.state = self.make_state()
+        bot.scanner = Scanner()
+        bot.signal_engine = Signal()
+        bot.order_mgr = Orders()
+        bot._scan_and_trade()
+        monitor = bot.state.get_state()["scan_monitor"]
+        self.assertEqual(monitor["status"], "complete")
+        self.assertEqual(monitor["processed_count"], 1)
+        self.assertEqual(monitor["markets"][0]["status"], "rejected")
+        self.assertEqual(monitor["markets"][0]["reason"], "btc_regime_neutral_alt_entry_paused")
 
     def test_entry_quality_requires_directional_close_and_volume(self):
         good = pd.DataFrame([

@@ -2,9 +2,11 @@
 
 import hmac
 import json
+import math
 import os
 import secrets
 import tempfile
+import threading
 import time
 from datetime import datetime, timedelta
 from functools import wraps
@@ -12,9 +14,12 @@ from functools import wraps
 from flask import (
     Flask, flash, jsonify, redirect, render_template, request, session, url_for,
 )
+import ccxt
+import pandas as pd
 
 import config
 from logger_setup import logger
+from signal_engine import SignalEngine
 from state_manager import StateManager
 
 
@@ -27,6 +32,64 @@ app.config.update(
 )
 state_manager = StateManager()
 _login_attempts = {}
+_chart_exchange = None
+_chart_cache = {}
+_chart_lock = threading.RLock()
+CHART_TIMEFRAMES = ("15m", "1h", "4h")
+
+
+def _finite(value):
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _market_chart(symbol, timeframe):
+    """OHLCV publik USD-M; tidak memakai API key akun trading."""
+    global _chart_exchange
+    key = (symbol, timeframe)
+    with _chart_lock:
+        cached = _chart_cache.get(key)
+        if cached and time.monotonic() - cached[0] < 10:
+            return cached[1]
+        if _chart_exchange is None:
+            _chart_exchange = ccxt.binance({
+                "enableRateLimit": True,
+                "options": {"defaultType": "future", "fetchCurrencies": False},
+            })
+            if config.TRADING_MODE == "testnet":
+                _chart_exchange.set_sandbox_mode(True)
+        bars = _chart_exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=240)
+        if len(bars) < 55:
+            raise ValueError("Data candle belum cukup untuk indikator")
+        frame = pd.DataFrame(bars, columns=[
+            "time", "open", "high", "low", "close", "volume",
+        ])
+        frame = SignalEngine(_chart_exchange).calculate_indicators(frame)
+        candles = []
+        for row in frame.tail(120).itertuples(index=False):
+            candles.append({
+                "time": int(row.time),
+                "open": _finite(row.open), "high": _finite(row.high),
+                "low": _finite(row.low), "close": _finite(row.close),
+                "volume": _finite(row.volume),
+                "ema21": _finite(row.ema_21), "ema55": _finite(row.ema_55),
+                "ema200": _finite(row.ema_200),
+                "rsi": _finite(row.rsi), "adx": _finite(row.adx),
+                "atr": _finite(row.atr),
+            })
+        payload = {
+            "symbol": symbol, "timeframe": timeframe,
+            "source": "Binance USD-M public market data",
+            "fetched_at": int(time.time() * 1000), "candles": candles,
+        }
+        _chart_cache[key] = (time.monotonic(), payload)
+        if len(_chart_cache) > 12:
+            oldest = min(_chart_cache, key=lambda item: _chart_cache[item][0])
+            _chart_cache.pop(oldest, None)
+        return payload
 
 
 def _csrf_token():
@@ -61,7 +124,8 @@ def security_headers(response):
     response.headers["Cache-Control"] = "no-store"
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; style-src 'self' 'unsafe-inline'; "
-        "script-src 'self' 'unsafe-inline'; img-src 'self' data:"
+        "script-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+        "connect-src 'self' wss://fstream.binance.com wss://fstream.binancefuture.com"
     )
     return response
 
@@ -200,6 +264,13 @@ def index():
     )
 
 
+@app.route("/markets")
+@login_required
+def markets():
+    return render_template("markets.html", username=session.get("username"),
+                           csrf_token=_csrf_token(), mode=config.TRADING_MODE)
+
+
 @app.route("/admin")
 @login_required
 def admin():
@@ -240,6 +311,46 @@ def update_config():
 @login_required
 def api_state():
     return jsonify(_enrich_state(_load_state()))
+
+
+@app.route("/api/scan")
+@login_required
+def api_scan():
+    state = _load_state()
+    return jsonify({
+        "scan": state.get("scan_monitor"),
+        "bot_status": state.get("bot_status"),
+        "connection_status": state.get("connection_status"),
+        "cooldown_until": state.get("cooldown_until"),
+        "active_position": state.get("active_position", {}).get("symbol")
+            if state.get("active_position") else None,
+        "server_time": time.time(),
+        "min_score": config.SIGNAL_MIN_SCORE,
+    })
+
+
+@app.route("/api/market/chart")
+@login_required
+def api_market_chart():
+    symbol = request.args.get("symbol", "")
+    timeframe = request.args.get("timeframe", config.TRADING_TIMEFRAME)
+    if timeframe not in CHART_TIMEFRAMES:
+        return jsonify({"error": "invalid_timeframe"}), 400
+    state = _load_state()
+    scan = state.get("scan_monitor") or {}
+    allowed = {row.get("symbol") for row in scan.get("markets", [])}
+    allowed.add("BTC/USDT:USDT")
+    for field in ("active_position", "pending_order", "last_signal"):
+        value = state.get(field) or {}
+        if value.get("symbol"):
+            allowed.add(value["symbol"])
+    if symbol not in allowed or not symbol.endswith("/USDT:USDT"):
+        return jsonify({"error": "market_not_in_scanner"}), 400
+    try:
+        return jsonify(_market_chart(symbol, timeframe))
+    except (ccxt.BaseError, ValueError, OSError) as exc:
+        logger.warning("Dashboard candle fetch failed for %s %s: %s", symbol, timeframe, exc)
+        return jsonify({"error": "market_data_unavailable"}), 503
 
 
 @app.route("/api/config")

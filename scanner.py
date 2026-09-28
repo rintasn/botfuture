@@ -16,6 +16,9 @@ class MarketScanner:
     
     def __init__(self, exchange):
         self.exchange = exchange
+        self.last_error = None
+        self.last_universe_count = 0
+        self.last_top_count = 0
 
     @staticmethod
     def _is_crypto_perpetual(market):
@@ -35,6 +38,9 @@ class MarketScanner:
             list[dict]: List koin yang lolos filter, sorted by score.
         """
         logger.debug("🔍 Scanning market untuk koin trending...")
+        self.last_error = None
+        self.last_universe_count = 0
+        self.last_top_count = 0
         
         try:
             # Layer 1: Ambil semua USDT perpetual futures
@@ -46,6 +52,7 @@ class MarketScanner:
                 and markets[s].get("type") == "swap"
                 and self._is_crypto_perpetual(markets[s])
             ]
+            self.last_universe_count = len(usdt_perps)
             
             # Layer 2: Fetch tickers dan filter by volume
             tickers = self.exchange.fetch_tickers(usdt_perps)
@@ -57,12 +64,21 @@ class MarketScanner:
             )
             
             top_tickers = sorted_tickers[:config.SCANNER_TOP_N]
+            self.last_top_count = len(top_tickers)
+            # USD-M 24h ticker tidak membawa bid/ask. Ambil best quote dari
+            # endpoint bookTicker, satu permintaan bulk untuk top market.
+            quotes = self.exchange.fetch_bids_asks(
+                [ticker["symbol"] for ticker in top_tickers]
+            ) if top_tickers else {}
+            if top_tickers and not quotes:
+                raise RuntimeError("Book ticker Binance kosong; spread tidak dapat diverifikasi")
             
             # Layer 3: Multi-filter
             candidates = []
             
             for ticker in top_tickers:
                 symbol = ticker["symbol"]
+                quote = quotes.get(symbol) or {}
                 
                 # Skip blacklisted coins
                 base_symbol = symbol.replace(":USDT", "")
@@ -72,8 +88,8 @@ class MarketScanner:
                 # Liquidity and quoted spread must be observable and finite.
                 try:
                     quote_volume = float(ticker.get("quoteVolume") or 0)
-                    bid = float(ticker.get("bid") or 0)
-                    ask = float(ticker.get("ask") or 0)
+                    bid = float(quote.get("bid") or 0)
+                    ask = float(quote.get("ask") or 0)
                     change_pct = abs(float(ticker.get("percentage") or 0))
                 except (TypeError, ValueError):
                     continue
@@ -114,5 +130,6 @@ class MarketScanner:
             return candidates
             
         except Exception as e:
+            self.last_error = str(e)
             logger.error(f"❌ Error scanning market: {e}")
             return []

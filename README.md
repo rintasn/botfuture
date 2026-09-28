@@ -11,7 +11,7 @@ Bot trading otomatis untuk Binance USDT-M Futures dengan strategi **Trend-Pullba
 | Single position | Satu posisi atau satu pending order dalam state bot |
 | Binance Futures | USDT perpetual futures melalui CCXT |
 | Leverage dan margin | Fixed 2x, isolated margin |
-| Market scanner | Hanya underlying crypto (`COIN`), lalu top 50 berdasarkan volume, volatilitas, spread, dan blacklist |
+| Market scanner | Hanya underlying crypto (`COIN`), lalu top N sesuai konfigurasi berdasarkan volume, volatilitas, spread, dan blacklist |
 | Strategi | TPLR: macro trend, EMA value zone, pullback, rejection candle, RSI, volume, dan ATR |
 | Multi-timeframe | 1H untuk arah makro dan 15m untuk setup entry |
 | BTC dominance filter | BTCDOMUSDT 1H untuk proyeksi entry altcoin dan 15m untuk exit reversal |
@@ -83,6 +83,8 @@ python run.py --dash-only
 ```
 
 Dashboard tersedia di `http://localhost:5000` secara default. Dashboard memperbarui data setiap empat detik dan menampilkan health status, performance metrics, equity curve, active risk, posisi, stop protection, signal, serta 20 trade terakhir.
+
+Halaman `/markets` menampilkan progres scan bot, seluruh kandidat yang lolos scanner likuiditas, alasan hasil analisis entry per koin, dan chart USD-M untuk market yang dipilih. Chart mempunyai candle 15m/1h/4h, EMA21/55/200, volume, RSI14, serta angka ADX14 dan ATR14. Candle aktif diperbarui lewat market WebSocket publik Binance; endpoint REST publik memperbarui indikator sekitar setiap 15 detik dan menjadi cadangan jika stream terputus. Semua endpoint dashboard tetap memerlukan login. Saat bot cooldown, sedang memantau posisi, atau belum menjalankan scan, halaman menunjukkan snapshot scan terakhir beserta waktunya, bukan hasil baru.
 
 Login default adalah username `qais` dan password `User\@mis1`. Nilai ini dapat dioverride melalui `DASHBOARD_USERNAME`, `DASHBOARD_PASSWORD`, dan `DASHBOARD_SECRET_KEY` di `.env`. Ganti secret key dengan string acak yang panjang pada VPS.
 
@@ -373,6 +375,7 @@ Semua parameter strategi dan operasional berada di `config.py`.
 | `BTCDOM_STRICT_ENTRY_FILTER` | true | Block entry alt yang melawan BTC.D |
 | `BTCDOM_EXIT_CONFIRMATION_CANDLES` | 2 | Closed candle untuk konfirmasi exit |
 | `SCANNER_TOP_N` | 300 | Jumlah market berdasarkan volume |
+| `MIN_QUOTE_VOLUME_USDT` | 10000000 | Minimum quote volume 24 jam scanner |
 | `CRYPTO_ONLY_SCANNER` | true | Hanya underlying type `COIN` |
 | `MIN_24H_CHANGE_PERCENT` | 1.0 | Volatilitas minimum |
 | `MAX_SPREAD_PERCENT` | 0.05 | Spread maksimum |

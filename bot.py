@@ -718,37 +718,104 @@ class TradingBot:
         self.state.set_status("scanning")
         
         candidates = self.scanner.scan()
+        scan_started = time.time()
+        monitor = {
+            "status": "scanning" if candidates else (
+                "error" if getattr(self.scanner, "last_error", None) else "complete"
+            ),
+            "started_at": scan_started,
+            "updated_at": scan_started,
+            "completed_at": None if candidates else scan_started,
+            "universe_count": getattr(self.scanner, "last_universe_count", 0),
+            "ranked_count": getattr(self.scanner, "last_top_count", 0),
+            "total_candidates": len(candidates),
+            "processed_count": 0,
+            "accepted_count": 0,
+            "error": getattr(self.scanner, "last_error", None),
+            "markets": [
+                {
+                    "symbol": item["symbol"],
+                    "price": item.get("price"),
+                    "quote_volume": item.get("quote_volume"),
+                    "spread_pct": item.get("spread_pct"),
+                    "change_24h": item.get("change_24h"),
+                    "scan_score": item.get("scan_score"),
+                    "status": "queued", "signal": "WAIT", "score": 0,
+                    "reason": "", "higher_tf_bias": "neutral",
+                    "btc_market_bias": "neutral", "btcdom_bias": "neutral",
+                }
+                for item in candidates
+            ],
+        }
+        self.state.set_scan_monitor(monitor)
         if not candidates:
             self.state.set_status("idle")
             return
         
         best_signal = None
+        last_publish = scan_started
         
-        for candidate in candidates:
+        for index, candidate in enumerate(candidates):
             symbol = candidate["symbol"]
+            row = monitor["markets"][index]
             
             is_sym_cd, _, _ = self.state.is_cooldown_active(symbol)
             if is_sym_cd:
-                continue
-                
-            signal_result = self.signal_engine.analyze(symbol)
-            
-            if signal_result["signal"] in ("LONG", "SHORT") and signal_result["score"] >= config.SIGNAL_MIN_SCORE:
-                signal_result["scan_score"] = candidate["scan_score"]
-                signal_result["selection_score"] = (
-                    float(signal_result["score"]) * 0.9
-                    + float(candidate["scan_score"]) * 0.1
+                row.update(status="cooldown", reason="symbol_cooldown")
+            else:
+                signal_result = self.signal_engine.analyze(symbol)
+                row.update(
+                    price=signal_result.get("price") or row["price"],
+                    signal=signal_result.get("signal", "WAIT"),
+                    score=signal_result.get("score", 0),
+                    reason=signal_result.get("details", {}).get("reason", ""),
+                    higher_tf_bias=signal_result.get("higher_tf_bias", "neutral"),
+                    btc_market_bias=signal_result.get("btc_market_bias", "neutral"),
+                    btcdom_bias=signal_result.get("btcdom_bias", "neutral"),
                 )
-                if best_signal is None or signal_result["selection_score"] > best_signal["selection_score"]:
-                    best_signal = signal_result
+                if signal_result["signal"] in ("LONG", "SHORT") and signal_result["score"] >= config.SIGNAL_MIN_SCORE:
+                    row["status"] = "qualified"
+                    monitor["accepted_count"] += 1
+                    signal_result["scan_score"] = candidate["scan_score"]
+                    signal_result["selection_score"] = (
+                        float(signal_result["score"]) * 0.9
+                        + float(candidate["scan_score"]) * 0.1
+                    )
+                    if best_signal is None or signal_result["selection_score"] > best_signal["selection_score"]:
+                        best_signal = signal_result
+                elif signal_result["signal"] in ("LONG", "SHORT"):
+                    row.update(status="below_score", reason="below_minimum_score")
+                else:
+                    row["status"] = "rejected"
+            monitor["processed_count"] = index + 1
+            if (index + 1) % 5 == 0 or time.time() - last_publish >= 2:
+                monitor["updated_at"] = time.time()
+                self.state.set_scan_monitor(monitor)
+                last_publish = monitor["updated_at"]
+
+        monitor["status"] = "complete"
+        monitor["updated_at"] = monitor["completed_at"] = time.time()
         
         if best_signal:
             # A broad scan can outlive a candle. Recheck the winner before entry.
             fresh = self.signal_engine.analyze(best_signal["symbol"])
             if fresh["signal"] != best_signal["signal"] or fresh["score"] < config.SIGNAL_MIN_SCORE:
                 logger.info("Selected entry invalidated during scan; skipping this cycle.")
+                for row in monitor["markets"]:
+                    if row["symbol"] == best_signal["symbol"]:
+                        row.update(status="invalidated", reason="selection_revalidation_failed")
+                        monitor["accepted_count"] = max(0, monitor["accepted_count"] - 1)
+                        break
+                self.state.set_scan_monitor(monitor)
                 return
             best_signal = fresh
+            for row in monitor["markets"]:
+                if row["symbol"] == best_signal["symbol"]:
+                    row.update(status="selected", score=best_signal["score"],
+                               signal=best_signal["signal"])
+                    break
+
+        self.state.set_scan_monitor(monitor)
 
         if best_signal and best_signal["score"] >= config.SIGNAL_MIN_SCORE:
             symbol = best_signal["symbol"]

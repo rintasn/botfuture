@@ -34,6 +34,7 @@ class StateManager:
             "current_checkpoint": 0,             # Checkpoint trailing saat ini
             "last_signal": None,                 # Signal terakhir yang terdeteksi
             "last_scan_time": None,              # Waktu scan terakhir
+            "scan_monitor": None,                # Snapshot scanner untuk dashboard
             "trade_history": [],                 # Riwayat trade
             "total_trades": 0,
             "total_profit": 0.0,
@@ -421,6 +422,13 @@ class StateManager:
             "time": datetime.now().isoformat(),
         }
         self.save()
+
+    def set_scan_monitor(self, snapshot):
+        """Publikasikan progres scan secara atomik untuk dashboard."""
+        with self._lock:
+            self.state["scan_monitor"] = copy.deepcopy(snapshot)
+            self.state["last_scan_time"] = snapshot.get("updated_at")
+            self.save()
     
     def set_status(self, status):
         """Update status bot."""

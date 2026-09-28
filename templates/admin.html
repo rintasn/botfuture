@@ -16,7 +16,7 @@
   </style>
 </head>
 <body><div class="wrap">
-  <header><div class="brand"><div class="logo">BF</div><span>Strategy Admin</span></div><nav><a href="/">Overview</a><a href="/admin">Admin</a></nav></header>
+  <header><div class="brand"><div class="logo">BF</div><span>Strategy Admin</span></div><nav><a href="/">Overview</a><a href="/markets">Market Scanner</a><a href="/admin">Admin</a></nav></header>
   <section class="hero"><div><h1>Runtime strategy configuration</h1><p>Parameter tervalidasi dan persisten. Bot mengambil snapshot pada awal siklus berikutnya.</p></div><div class="mode">{{ mode }} TRADING</div></section>
   <div class="notice"><strong>Perhatian:</strong> perubahan exit dan circuit breaker dapat memengaruhi posisi aktif pada loop berikutnya. API key, mode trading, mandatory stop, dan jumlah maksimum posisi tidak dapat diubah dari panel ini.{% if active_position %}<br><strong>Posisi aktif:</strong> {{ active_position.symbol }} {{ active_position.side|upper }} — ubah parameter dengan hati-hati.{% endif %}</div>
   {% with messages = get_flashed_messages(with_categories=true) %}{% for category,message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}{% endwith %}

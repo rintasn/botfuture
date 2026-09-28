@@ -18,7 +18,7 @@
 </head>
 <body>
 <div class="wrap">
-  <header><div class="brand"><div class="logo">BF</div><span>Futures Command Center</span></div><nav><a href="/">Overview</a><a href="/admin">Strategy Admin</a><span class="user">{{ username }}</span><form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="logout">Logout</button></form></nav></header>
+  <header><div class="brand"><div class="logo">BF</div><span>Futures Command Center</span></div><nav><a href="/">Overview</a><a href="/markets">Market Scanner</a><a href="/admin">Strategy Admin</a><span class="user">{{ username }}</span><form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="logout">Logout</button></form></nav></header>
   <section class="hero"><div><h1>Trading operations</h1><p>Live telemetry, risk protection, dan hasil strategi dalam satu tampilan.</p></div><div id="liveBadge" class="live"><span class="dot"></span><span id="statusText">Connecting…</span></div></section>
   <main class="grid">
     <section class="card"><div class="title">Net PnL <span>USDT</span></div><div id="totalProfit" class="value">—</div><div id="avgPnl" class="sub">Average —</div></section>
@@ -34,6 +34,8 @@
 
     <section class="card span5"><div class="title">Latest signal <span id="signalTime">—</span></div><div id="signal"><div class="empty">Belum ada signal</div></div></section>
     <section class="card span7"><div class="title">Risk & execution state <span id="cooldown">—</span></div><div id="riskState" class="metrics"></div></section>
+
+    <section class="card full"><div class="title">Market scanner <a href="/markets" class="muted" style="text-transform:none;text-decoration:none">Lihat chart & kandidat →</a></div><div id="scanSummary" class="metrics"><div class="empty">Menunggu scan pertama bot.</div></div></section>
 
     <section class="card full"><div class="title">Recent trade ledger <span>20 terakhir</span></div><div id="history" class="tablebox"><div class="empty">Belum ada trade</div></div></section>
   </main>
@@ -51,6 +53,7 @@ function update(s){const d=s.dashboard||{},p=d.performance||{},cfg=d.config||{};
  $('cooldown').textContent=d.cooldown_remaining?`Cooldown ${duration(d.cooldown_remaining)}`:'Ready';$('riskState').innerHTML=[['Pending order',s.pending_order?`${s.pending_order.side} ${s.pending_order.symbol}`:'none'],['Current checkpoint',(s.current_checkpoint||0)+'%'],['Global cooldown',duration(d.cooldown_remaining)],['Last API error',s.last_api_error?.message||'none'],['Timeframe',`${cfg.timeframe} / ${cfg.higher_timeframe}`],['Bot state',status]].map(x=>`<div class="mini"><div class="k">${esc(x[0])}</div><div class="v">${esc(x[1])}</div></div>`).join('');
  const trades=s.trade_history||[];$('tradeCount').textContent=`${trades.length} trades · ${p.estimated_trades||0} PnL estimated`;drawChart(trades);const recent=trades.slice(-20).reverse();$('history').innerHTML=recent.length?`<table><thead><tr><th>Closed</th><th>Market</th><th>Side</th><th>PnL / quality</th><th>R</th><th>MFE / MAE</th><th>Exit reason</th></tr></thead><tbody>${recent.map(t=>`<tr><td>${t.close_time?new Date(t.close_time).toLocaleString():'—'}</td><td>${esc(t.symbol)}</td><td><span class="pill ${t.side==='long'?'long':'short'}">${esc(t.side)}</span></td><td class="${Number(t.pnl)>=0?'positive':'negative'}">${signed(t.pnl)}<br><small>${esc(t.pnl_status||'legacy_estimate')}</small></td><td>${t.realized_r==null?'—':signed(t.realized_r)+'R'}</td><td>${num(t.highest_profit_pct)}% / ${num(t.lowest_profit_pct)}%</td><td>${esc(t.close_reason||'—')}</td></tr>`).join('')}</tbody></table>`:'<div class="empty">Belum ada trade</div>';
 }
-async function refresh(){try{const r=await fetch('/api/state',{cache:'no-store'});if(r.status===401){location='/login';return}if(!r.ok)throw Error(`HTTP ${r.status}`);update(await r.json());$('error').style.display='none'}catch(e){$('error').textContent='Dashboard disconnected: '+e.message;$('error').style.display='block';$('liveBadge').className='live bad'}}refresh();setInterval(refresh,4000);
+function updateScanSummary(s){const scan=s.scan_monitor;$('scanSummary').innerHTML=[['Status',scan?.status||'waiting'],['Kandidat',scan?.total_candidates||0],['Diproses',scan?.processed_count||0],['Lolos',scan?.accepted_count||0],['Scan terakhir',scan?.updated_at?new Date(scan.updated_at*1000).toLocaleString():'—'],['Chart','Buka Market Scanner →']].map(x=>`<div class="mini"><div class="k">${esc(x[0])}</div><div class="v">${esc(x[1])}</div></div>`).join('')}
+async function refresh(){try{const r=await fetch('/api/state',{cache:'no-store'});if(r.status===401){location='/login';return}if(!r.ok)throw Error(`HTTP ${r.status}`);const state=await r.json();update(state);updateScanSummary(state);$('error').style.display='none'}catch(e){$('error').textContent='Dashboard disconnected: '+e.message;$('error').style.display='block';$('liveBadge').className='live bad'}}refresh();setInterval(refresh,4000);
 </script>
 </body></html>
