@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Strategy Admin · Futures Command Center</title>
+  <style>
+    :root{color-scheme:dark;--bg:#070b12;--panel:#101722;--line:#243044;--text:#edf3fb;--muted:#8492a7;--gold:#f6c453;--green:#39d98a;--red:#ff647c}
+    *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 10% -10%,#182740 0,transparent 28%),var(--bg);color:var(--text);font-family:Inter,Segoe UI,sans-serif}.wrap{max-width:1320px;margin:auto;padding:0 24px 50px}
+    header{height:72px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between}.brand{display:flex;align-items:center;gap:12px;font-weight:850}.logo{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;background:#f6c4531c;border:1px solid #f6c45355;color:var(--gold)}nav{display:flex;gap:8px}nav a{color:#aeb9c8;text-decoration:none;padding:9px 12px;border-radius:9px}nav a:hover{background:#ffffff0a;color:white}
+    .hero{padding:30px 0 20px;display:flex;justify-content:space-between;gap:20px;align-items:flex-end}.hero h1{margin:0 0 8px;font-size:28px}.hero p{margin:0;color:var(--muted);line-height:1.55}.mode{padding:8px 12px;border:1px solid #ff647c55;background:#ff647c12;color:#ff91a2;border-radius:999px;font-size:12px;font-weight:800}
+    .notice,.flash{border-radius:12px;padding:14px 16px;font-size:13px;line-height:1.55;margin-bottom:15px}.notice{border:1px solid #f6c4534d;background:#f6c4530d;color:#e9cf8f}.flash.success{border:1px solid #39d98a55;background:#39d98a12;color:#75e6ad}.flash.error{border:1px solid #ff647c55;background:#ff647c12;color:#ff9aaa}
+    .category{background:linear-gradient(145deg,#111a27,#0d141f);border:1px solid var(--line);border-radius:17px;margin:15px 0;overflow:hidden}.cathead{padding:17px 20px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}.cathead h2{font-size:15px;margin:0}.cathead span{font-size:11px;color:var(--muted)}.fields{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line)}.field{background:var(--panel);padding:17px 20px;min-width:0}.field label{display:block;font-size:12px;font-weight:700;margin-bottom:6px}.code{font:10px ui-monospace,SFMono-Regular,monospace;color:#68778d;overflow-wrap:anywhere}.field input[type=number]{width:100%;margin-top:12px;padding:10px 11px;background:#090f18;border:1px solid var(--line);border-radius:9px;color:white;outline:none}.field input:focus{border-color:var(--gold)}
+    .switchrow{display:flex;align-items:center;justify-content:space-between;margin-top:13px}.switch{position:relative;width:44px;height:24px}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;inset:0;background:#263246;border-radius:99px;cursor:pointer;transition:.2s}.slider:before{content:'';position:absolute;width:18px;height:18px;left:3px;top:3px;border-radius:50%;background:white;transition:.2s}.switch input:checked+.slider{background:var(--green)}.switch input:checked+.slider:before{transform:translateX(20px)}
+    .actions{position:sticky;bottom:15px;margin-top:20px;padding:14px 16px;background:#0b111bcc;border:1px solid var(--line);backdrop-filter:blur(14px);border-radius:14px;display:flex;align-items:center;justify-content:space-between;gap:15px;box-shadow:0 20px 50px #0008}.actions span{font-size:12px;color:var(--muted)}button{border:0;border-radius:10px;padding:12px 18px;background:linear-gradient(135deg,#f6c453,#df9f24);font-weight:850;color:#181005;cursor:pointer}
+    @media(max-width:900px){.fields{grid-template-columns:1fr 1fr}}@media(max-width:600px){.wrap{padding:0 14px 35px}.fields{grid-template-columns:1fr}.hero{align-items:flex-start;flex-direction:column}.actions{align-items:stretch;flex-direction:column}.actions button{width:100%}}
+  </style>
+</head>
+<body><div class="wrap">
+  <header><div class="brand"><div class="logo">BF</div><span>Strategy Admin</span></div><nav><a href="/">Overview</a><a href="/admin">Admin</a></nav></header>
+  <section class="hero"><div><h1>Runtime strategy configuration</h1><p>Parameter tervalidasi dan persisten. Bot mengambil snapshot pada awal siklus berikutnya.</p></div><div class="mode">{{ mode }} TRADING</div></section>
+  <div class="notice"><strong>Perhatian:</strong> perubahan exit dan circuit breaker dapat memengaruhi posisi aktif pada loop berikutnya. API key, mode trading, mandatory stop, dan jumlah maksimum posisi tidak dapat diubah dari panel ini.{% if active_position %}<br><strong>Posisi aktif:</strong> {{ active_position.symbol }} {{ active_position.side|upper }} — ubah parameter dengan hati-hati.{% endif %}</div>
+  {% with messages = get_flashed_messages(with_categories=true) %}{% for category,message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}{% endwith %}
+  <form method="post" action="/admin/config" onsubmit="return confirm('Terapkan parameter strategi ini ke bot LIVE?')">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    {% for category, fields in groups.items() %}
+    <section class="category"><div class="cathead"><h2>{{ category }}</h2><span>{{ fields|length }} parameters</span></div><div class="fields">
+      {% for field in fields %}<div class="field"><label for="{{ field.name }}">{{ field.label }}</label><div class="code">{{ field.name }}</div>
+        {% if field.type == 'bool' %}<div class="switchrow"><span class="code">OFF / ON</span><label class="switch"><input type="hidden" name="{{ field.name }}" value="false"><input id="{{ field.name }}" name="{{ field.name }}" type="checkbox" value="true" {% if field.value %}checked{% endif %}><span class="slider"></span></label></div>
+        {% else %}<input id="{{ field.name }}" name="{{ field.name }}" type="number" value="{{ field.value }}" min="{{ field.min }}" max="{{ field.max }}" step="{{ field.step }}" required><div class="code" style="margin-top:6px">Range {{ field.min }} – {{ field.max }}</div>{% endif %}
+      </div>{% endfor %}
+    </div></section>
+    {% endfor %}
+    <div class="actions"><span>Disimpan ke <strong>strategy_overrides.json</strong> secara atomic.</span><button type="submit">Save & apply strategy</button></div>
+  </form>
+</div></body></html>

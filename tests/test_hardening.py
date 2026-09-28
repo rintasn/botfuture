@@ -159,6 +159,104 @@ class HardeningTests(unittest.TestCase):
         candidates = MarketScanner(Exchange()).scan()
         self.assertEqual([item["symbol"] for item in candidates], ["BTC/USDT:USDT"])
 
+    def test_scanner_rejects_thin_or_unquoted_market(self):
+        class Exchange:
+            def load_markets(self):
+                return {
+                    f"{base}/USDT:USDT": {
+                        "active": True, "type": "swap", "info": {"underlyingType": "COIN"},
+                    }
+                    for base in ("BTC", "THIN", "NOBID")
+                }
+
+            def fetch_tickers(self, symbols):
+                return {
+                    symbol: {
+                        "symbol": symbol,
+                        "quoteVolume": 1_000_000 if symbol.startswith("THIN") else 20_000_000,
+                        "percentage": 3, "bid": None if symbol.startswith("NOBID") else 100,
+                        "ask": 100.01, "last": 100,
+                    }
+                    for symbol in symbols
+                }
+
+        candidates = MarketScanner(Exchange()).scan()
+        self.assertEqual([item["symbol"] for item in candidates], ["BTC/USDT:USDT"])
+
+    def test_entry_quality_requires_directional_close_and_volume(self):
+        good = pd.DataFrame([
+            {"open": 100, "high": 101, "low": 99, "close": 100, "volume": 100,
+             "vol_sma": 100, "atr": 2, "ema_21": 100},
+            {"open": 99.5, "high": 101, "low": 98, "close": 100.5, "volume": 120,
+             "vol_sma": 100, "atr": 2, "ema_21": 100},
+        ])
+        self.assertTrue(SignalEngine._entry_candle_quality(good, "long")[0])
+        weak = good.copy()
+        weak.loc[1, "volume"] = 50
+        self.assertEqual(
+            SignalEngine._entry_candle_quality(weak, "long")[1], "entry_candle_volume_weak",
+        )
+        wrong_direction = good.copy()
+        wrong_direction.loc[1, "close"] = 99
+        self.assertEqual(
+            SignalEngine._entry_candle_quality(wrong_direction, "long")[1],
+            "entry_candle_no_bullish_followthrough",
+        )
+
+    def test_neutral_btc_blocks_alt_entry_before_order_plan(self):
+        engine = SignalEngine(None)
+        frame = pd.DataFrame([
+            {"timestamp": i, "open": 99, "high": 101, "low": 98, "close": 100,
+             "ema_21": 99, "ema_55": 97, "ema_200": 90, "atr": 2,
+             "volume": 120, "vol_sma": 100, "rsi": 55, "adx": 30}
+            for i in range(7)
+        ])
+        engine.fetch_candles = lambda *args, **kwargs: frame.copy()
+        engine.calculate_indicators = lambda df: df
+        engine._get_macro_trend = lambda symbol: "bullish"
+        engine._get_btcdom_context = lambda: {"trend": "neutral", "projection": "balanced"}
+        engine._get_btc_market_context = lambda: {"trend": "neutral"}
+        engine._check_pullback_long = lambda df: (True, 95, {})
+        engine._entry_candle_quality = lambda df, side: (True, "entry_candle_confirmed")
+        result = engine.analyze("ETH/USDT:USDT")
+        self.assertEqual(result["signal"], "WAIT")
+        self.assertEqual(result["details"]["reason"], "btc_regime_neutral_alt_entry_paused")
+        frame.loc[6, "close"] = 110  # Live move; previous closed signal is unchanged.
+        chased = engine.analyze("ETH/USDT:USDT")
+        self.assertEqual(chased["details"]["reason"], "live_price_chasing_long")
+
+    def test_four_hour_disagreement_blocks_alt_entry(self):
+        engine = SignalEngine(None)
+        frame = pd.DataFrame([
+            {"timestamp": i, "open": 99, "high": 101, "low": 98, "close": 100,
+             "ema_21": 99, "ema_55": 97, "ema_200": 90, "atr": 2,
+             "volume": 120, "vol_sma": 100, "rsi": 55, "adx": 30}
+            for i in range(7)
+        ])
+        engine.fetch_candles = lambda *args, **kwargs: frame.copy()
+        engine.calculate_indicators = lambda df: df
+        engine._get_macro_trend = lambda symbol: "bullish"
+        engine._get_btcdom_context = lambda: {"trend": "neutral", "projection": "balanced"}
+        engine._get_btc_market_context = lambda: {"trend": "bullish"}
+        engine._check_pullback_long = lambda df: (True, 95, {})
+        engine._entry_candle_quality = lambda df, side: (True, "entry_candle_confirmed")
+        engine._get_entry_anchor = lambda symbol: "bearish"
+        result = engine.analyze("ETH/USDT:USDT")
+        self.assertEqual(result["signal"], "WAIT")
+        self.assertEqual(result["details"]["reason"], "4h_trend_not_bullish")
+
+    def test_four_hour_anchor_ignores_unfinished_candle(self):
+        engine = SignalEngine(None)
+        frame = pd.DataFrame([
+            {"close": 110, "ema_21": 108, "ema_55": 105, "ema_200": 100}
+            for _ in range(203)
+        ])
+        frame.loc[200, "ema_21"] = 107
+        frame.loc[202, ["close", "ema_21", "ema_55", "ema_200"]] = [80, 90, 100, 105]
+        engine.fetch_candles = lambda *args, **kwargs: frame.copy()
+        engine.calculate_indicators = lambda df: df
+        self.assertEqual(engine._get_entry_anchor("ETH/USDT:USDT"), "bullish")
+
     def test_startup_reconciliation_clears_stale_pending_when_exchange_flat(self):
         class Exchange(BaseFakeExchange):
             def fetch_positions(self):
@@ -442,6 +540,84 @@ class HardeningTests(unittest.TestCase):
         self.assertTrue(bot._ensure_stop_protection())
         self.assertEqual(events, [("place", 96.0), ("cancel", "old")])
         self.assertEqual(state.get_trailing_stop()["order_id"], "new")
+
+    def test_active_candle_does_not_trigger_reversal(self):
+        class Exchange:
+            pass
+
+        engine = SignalEngine(Exchange())
+        frame = pd.DataFrame([
+            {"close": 100, "ema_21": 99, "ema_55": 95, "rsi": 50},
+            {"close": 101, "ema_21": 100, "ema_55": 96, "rsi": 52},
+            {"close": 102, "ema_21": 101, "ema_55": 97, "rsi": 53},
+            # Candle aktif jatuh tajam, tetapi belum boleh menjadi keputusan exit.
+            {"close": 80, "ema_21": 99, "ema_55": 96, "rsi": 20},
+        ])
+        engine.fetch_candles = lambda *args, **kwargs: frame.copy()
+        engine.calculate_indicators = lambda df: df
+        result = engine.check_reversal("BTC/USDT:USDT", "long")
+        self.assertFalse(result["reversed"])
+
+    def test_tp1_reduces_half_and_moves_stop_to_bep(self):
+        state = self.make_state()
+        state.set_position(
+            "BTC/USDT:USDT", "long", 100, 1, "entry",
+            initial_stop_plan={"stop_price": 99, "distance_pct": 1},
+        )
+        state.set_trailing_stop("old-stop", 99, 0, amount=1)
+
+        class Orders:
+            def reduce_position(self, symbol, side, amount, reason, flag):
+                state.record_partial_exit(amount, 0.5, reason, flag)
+                return {"id": "tp1"}
+
+            def place_stop_order(self, symbol, side, amount, stop_price):
+                return {"id": "new-stop"}
+
+            def cancel_stop_order(self, symbol, order_id):
+                return "canceled"
+
+        manager = TrailingManager(Orders(), state)
+        result = manager.update("BTC/USDT:USDT", 100, 101, "long", 1)
+        self.assertEqual(result["action"], "partial_tp1")
+        self.assertAlmostEqual(state.get_position()["amount"], 0.5)
+        self.assertTrue(state.get_position()["tp1_done"])
+        self.assertGreaterEqual(state.get_trailing_stop()["stop_price"], 100.22)
+
+    def test_risk_circuit_pauses_after_two_r_daily_loss(self):
+        state = self.make_state()
+        for _ in range(2):
+            state.set_position(
+                "BTC/USDT:USDT", "long", 100, 1, "entry",
+                initial_stop_plan={"stop_price": 99, "distance_pct": 1},
+            )
+            state.clear_position(pnl=-1, reason="test_loss", start_cooldown=False)
+        active, reason = state.evaluate_risk_circuit()
+        self.assertTrue(active)
+        self.assertIn("daily_loss", reason)
+        self.assertGreater(state.state["cooldown_until"], time.time())
+
+    def test_soft_reversal_reduces_instead_of_full_close(self):
+        class Signal:
+            def check_reversal(self, symbol, side):
+                return {
+                    "reversed": True, "signal": "REDUCE_LONG",
+                    "severity": "reduce", "details": {},
+                }
+
+        class Orders:
+            def close_position(self, **kwargs):
+                raise AssertionError("soft reversal tidak boleh full close")
+
+        class Trailing:
+            def reduce_and_resize_stop(self, *args, **kwargs):
+                return True
+
+        state = self.make_state()
+        state.set_position("BTC/USDT:USDT", "long", 100, 1, "entry")
+        guard = ReversalGuard(Signal(), Orders(), Trailing(), state)
+        result = guard.check_and_act()
+        self.assertEqual(result["action"], "reduced")
 
 
 if __name__ == "__main__":

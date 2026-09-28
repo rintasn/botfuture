@@ -17,7 +17,7 @@ import sys
 from datetime import datetime
 import signal as os_signal
 import ccxt
-import config
+from runtime_config import config, strategy_cycle
 from logger_setup import logger
 from state_manager import StateManager
 from scanner import MarketScanner
@@ -189,21 +189,16 @@ class TradingBot:
             try:
                 iteration += 1
                 
-                self._drain_user_stream()
-
-                # Partial fill dapat membuat position + pending remainder hidup
-                # bersamaan. Remainder selalu ditangani lebih dahulu.
-                had_pending = self.state.has_pending_order()
-                if had_pending:
-                    self._handle_pending_order()
-
-                # Fill baru sudah memasang hard-stop di _handle_pending_order.
-                # Jangan verifikasi lagi pada iterasi yang sama karena Binance
-                # Algo Order memiliki eventual-consistency beberapa detik.
-                if self.state.has_position() and not had_pending:
-                    self._handle_active_position()
-                elif not self.state.has_pending_order():
-                    self._scan_and_trade()
+                with strategy_cycle():
+                    self._drain_user_stream()
+                    had_pending = self.state.has_pending_order()
+                    if had_pending:
+                        self._handle_pending_order()
+                    if self.state.has_position() and not had_pending:
+                        self._handle_active_position()
+                    elif not self.state.has_pending_order():
+                        self.order_mgr.reconcile_trade_ledger()
+                        self._scan_and_trade()
                 
                 time.sleep(config.MAIN_LOOP_INTERVAL)
                 
@@ -239,6 +234,8 @@ class TradingBot:
     
     def _handle_active_position(self):
         """Monitor posisi aktif: trailing stop & reversal guard."""
+        if not self.order_mgr.recover_exit_intent():
+            return
         pos = self.state.get_position()
         if not pos:
             return
@@ -268,7 +265,7 @@ class TradingBot:
             )
             self.order_mgr.cancel_all_orders(symbol)
             self.state.clear_position(
-                pnl=real_pnl,
+                pnl=real_pnl if amount > 0 else 0,
                 reason="position_closed_on_exchange",
                 start_cooldown=True,
             )
@@ -350,10 +347,16 @@ class TradingBot:
             if trail_result["action"] == "protection_missing":
                 self._ensure_stop_protection()
             return
+
+        if trail_result["action"] in (
+            "partial_tp1", "partial_tp2", "partial_tp1_pending", "partial_tp2_pending",
+            "early_bep", "time_stop_closed"
+        ):
+            return
         
         # Reversal Guard (15m Timeframe)
         reversal_result = self.reversal_guard.check_and_act()
-        if reversal_result["action"] == "closed":
+        if reversal_result["action"] in ("closed", "reduced"):
             logger.info(
                 f"🔴 Position closed by reversal guard: {reversal_result['reason']}"
             )
@@ -447,6 +450,17 @@ class TradingBot:
                 self._ensure_stop_protection()
                 
         elif status == "open":
+            revalidate_every = float(getattr(config, "PENDING_REVALIDATION_SECONDS", 30))
+            last_validation = float(order.get("last_signal_validation", 0) or 0)
+            if time.time() - last_validation >= revalidate_every:
+                validation = self.signal_engine.validate_pending_entry(symbol, order["side"])
+                self.state.mark_pending_validated()
+                if not validation["valid"]:
+                    logger.warning(
+                        f"Pending entry {symbol} dibatalkan: {validation['reason']}"
+                    )
+                    self.order_mgr.cancel_order(symbol, order_id)
+                    return
             elapsed = time.time() - order["placed_time"]
             remaining = (timeout_min * 60) - elapsed
             logger.info(
@@ -517,7 +531,8 @@ class TradingBot:
                     )
                     old_stop_id = stop["order_id"]
                     if self._place_emergency_sl(pos, fail_close=False):
-                        self.order_mgr.cancel_stop_order(pos["symbol"], old_stop_id)
+                        if str((self.state.get_trailing_stop() or {}).get("order_id")) != str(old_stop_id):
+                            self.order_mgr.cancel_stop_order(pos["symbol"], old_stop_id)
                         return True
                     # Stop legacy tetap aktif; jangan fail-close atau menandai
                     # posisi unprotected hanya karena tightening gagal.
@@ -533,7 +548,8 @@ class TradingBot:
                 logger.warning("⚠️ Ukuran stop tidak sama dengan posisi; mengganti stop secara aman.")
                 old_stop_id = stop["order_id"]
                 if self._place_emergency_sl(pos, fail_close=False):
-                    self.order_mgr.cancel_stop_order(pos["symbol"], old_stop_id)
+                    if str((self.state.get_trailing_stop() or {}).get("order_id")) != str(old_stop_id):
+                        self.order_mgr.cancel_stop_order(pos["symbol"], old_stop_id)
                     return True
                 self.state.set_protection_status("failed", "Stop tidak mencakup seluruh posisi")
                 if getattr(config, "FAIL_CLOSE_IF_STOP_UNPROTECTED", True):
@@ -607,6 +623,20 @@ class TradingBot:
                 else entry * (1 + max_pct / 100)
             )
             source = "max_distance_fallback"
+
+        effective_plan = dict(plan or {})
+        effective_plan.update({
+            "stop_price": sl_price,
+            "distance_pct": distance_pct,
+            "method": source,
+        })
+        if not pos.get("initial_risk_pct"):
+            self.state.set_initial_risk(effective_plan)
+        # Resizing/recovering protection must never surrender a locked profit.
+        previous_stop = self.state.get_trailing_stop() or {}
+        previous_price = float(previous_stop.get("stop_price") or 0)
+        if previous_price > 0:
+            sl_price = max(sl_price, previous_price) if side == "long" else min(sl_price, previous_price)
             
         logger.info(
             f"🛡️ Placing adaptive hard-stop for {symbol} at {sl_price:.8f} "
@@ -625,7 +655,7 @@ class TradingBot:
             self.state.set_trailing_stop(
                 stop_order_id=stop_order["id"],
                 stop_price=sl_price,
-                checkpoint_level=0,
+                checkpoint_level=float(previous_stop.get("checkpoint_level") or self.state.get_current_checkpoint() or 0),
                 amount=amount,
             )
             logger.info(f"✅ Emergency SL active on Binance! ID: {stop_order['id']}")
@@ -651,6 +681,8 @@ class TradingBot:
     
     def _scan_and_trade(self):
         """Scan market, analisis signal, dan place order jika ada signal."""
+        if self.state.has_position() or self.state.has_pending_order() or self.state.get_exit_intent():
+            return
         now = time.time()
         
         # 1. Cek Cooldown
@@ -662,6 +694,12 @@ class TradingBot:
                 else:
                     logger.info(f"⏳ Cooldown aktif ({int(rem_sec)}s tersisa). Alasan: {reason}")
                 self._last_cooldown_log = now
+            self.state.set_status("cooldown")
+            return
+
+        circuit_active, circuit_reason = self.state.evaluate_risk_circuit()
+        if circuit_active:
+            logger.critical(f"Risk circuit breaker aktif: {circuit_reason}")
             self.state.set_status("cooldown")
             return
             
@@ -695,11 +733,23 @@ class TradingBot:
                 
             signal_result = self.signal_engine.analyze(symbol)
             
-            if signal_result["signal"] in ("LONG", "SHORT"):
-                if best_signal is None or signal_result["score"] > best_signal["score"]:
+            if signal_result["signal"] in ("LONG", "SHORT") and signal_result["score"] >= config.SIGNAL_MIN_SCORE:
+                signal_result["scan_score"] = candidate["scan_score"]
+                signal_result["selection_score"] = (
+                    float(signal_result["score"]) * 0.9
+                    + float(candidate["scan_score"]) * 0.1
+                )
+                if best_signal is None or signal_result["selection_score"] > best_signal["selection_score"]:
                     best_signal = signal_result
-                    best_signal["scan_score"] = candidate["scan_score"]
         
+        if best_signal:
+            # A broad scan can outlive a candle. Recheck the winner before entry.
+            fresh = self.signal_engine.analyze(best_signal["symbol"])
+            if fresh["signal"] != best_signal["signal"] or fresh["score"] < config.SIGNAL_MIN_SCORE:
+                logger.info("Selected entry invalidated during scan; skipping this cycle.")
+                return
+            best_signal = fresh
+
         if best_signal and best_signal["score"] >= config.SIGNAL_MIN_SCORE:
             symbol = best_signal["symbol"]
             signal = best_signal["signal"]
@@ -727,6 +777,7 @@ class TradingBot:
                 score=score,
                 suggested_price=suggested_p,
                 initial_stop_plan=best_signal.get("initial_stop_plan"),
+                signal_context=best_signal.get("entry_signal_snapshot"),
             )
             
             if order:

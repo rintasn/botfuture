@@ -10,14 +10,14 @@ Bot trading otomatis untuk Binance USDT-M Futures dengan strategi **Trend-Pullba
 |---|---|
 | Single position | Satu posisi atau satu pending order dalam state bot |
 | Binance Futures | USDT perpetual futures melalui CCXT |
-| Leverage dan margin | Fixed 3x, isolated margin |
+| Leverage dan margin | Fixed 2x, isolated margin |
 | Market scanner | Hanya underlying crypto (`COIN`), lalu top 50 berdasarkan volume, volatilitas, spread, dan blacklist |
 | Strategi | TPLR: macro trend, EMA value zone, pullback, rejection candle, RSI, volume, dan ATR |
 | Multi-timeframe | 1H untuk arah makro dan 15m untuk setup entry |
 | BTC dominance filter | BTCDOMUSDT 1H untuk proyeksi entry altcoin dan 15m untuk exit reversal |
 | Dynamic limit entry | Harga limit dihitung dari EMA 21 dan ATR pullback |
 | Tiered timeout | GTD exchange-side 10/15 menit, plus dead-man switch 120 detik |
-| Position sizing | Minimum dari batas exposure 35% saldo x leverage dan risk budget 1% wallet |
+| Position sizing | Minimum dari batas exposure 25% saldo x leverage dan risk budget 1% wallet |
 | Adaptive hard-stop | ATR/EMA55/swing 15m, jarak 1–5%, wajib aktif di exchange |
 | Trailing stop | Price checkpoint, time-progressive lock, dan delayed breakeven |
 | Reversal guard | Market close ketika struktur EMA 21/55 berbalik |
@@ -25,7 +25,7 @@ Bot trading otomatis untuk Binance USDT-M Futures dengan strategi **Trend-Pullba
 | Recovery | Startup reconciliation terhadap posisi, entry order, dan algo stop Binance |
 | User stream | WebSocket order dan position events, dengan REST sebagai sumber rekonsiliasi |
 | Persistence | Atomic JSON state untuk posisi, order, stop, koneksi, statistik, dan cooldown |
-| Dashboard | Monitoring state dan riwayat trade melalui Flask |
+| Dashboard | Authenticated command center, telemetry, performance, dan strategy admin |
 
 ## Persyaratan dan instalasi
 
@@ -82,9 +82,11 @@ python run.py --dashboard
 python run.py --dash-only
 ```
 
-Dashboard tersedia di `http://localhost:5000` secara default. Dashboard memperbarui data setiap lima detik dan menampilkan status, statistik, posisi, trailing stop, signal terakhir, serta sepuluh trade terakhir.
+Dashboard tersedia di `http://localhost:5000` secara default. Dashboard memperbarui data setiap empat detik dan menampilkan health status, performance metrics, equity curve, active risk, posisi, stop protection, signal, serta 20 trade terakhir.
 
-> Dashboard bind ke `0.0.0.0` dan belum memiliki autentikasi. Jangan mengekspos port dashboard ke internet.
+Login default adalah username `qais` dan password `User\@mis1`. Nilai ini dapat dioverride melalui `DASHBOARD_USERNAME`, `DASHBOARD_PASSWORD`, dan `DASHBOARD_SECRET_KEY` di `.env`. Ganti secret key dengan string acak yang panjang pada VPS.
+
+Halaman `/admin` hanya mengekspos parameter strategi yang di-whitelist. Perubahan divalidasi, langsung diterapkan ke proses bot, lalu disimpan atomik ke `strategy_overrides.json` agar tetap aktif setelah restart. API key, API secret, trading mode, mandatory stop, dan maksimum posisi tidak dapat diubah dari panel.
 
 ## Alur utama bot
 
@@ -115,7 +117,7 @@ Reconciliation hanya mengenali order dari ID yang tersimpan atau prefix `bf_`. B
 
 ### 2. Market scanning
 
-Scanner lebih dulu menerima hanya kontrak swap USDT aktif dengan metadata Binance `underlyingType=COIN`. Komoditas, saham, ETF, indeks, dan kontrak TradFi seperti XAG ditolak secara fail-closed sebelum ranking volume. Dari 50 market crypto teratas, bot menerapkan filter:
+Scanner lebih dulu menerima hanya kontrak swap USDT aktif dengan metadata Binance `underlyingType=COIN`. Komoditas, saham, ETF, indeks, dan kontrak TradFi seperti XAG ditolak secara fail-closed sebelum ranking volume. Dari maksimal 300 market crypto teratas, bot menerapkan filter:
 
 - Coin tidak terdapat pada blacklist.
 - Perubahan harga absolut 24 jam minimal 1%.
@@ -126,12 +128,12 @@ Scanner lebih dulu menerima hanya kontrak swap USDT aktif dengan metadata Binanc
 
 Signal engine memakai dua timeframe:
 
-- **1H:** menentukan bias makro bullish, bearish, atau neutral dari EMA 21/55 dan posisi harga.
+- **1H:** menentukan bias makro dari EMA 21/55/200, slope EMA21, dan ADX minimal 25.
 - **15m:** mencari pullback dan liquidity rejection untuk entry.
 
 Setup LONG membutuhkan:
 
-- Bias 1H bullish atau neutral.
+- Bias 1H bullish; regime neutral hanya dapat lolos dengan skor minimal 92.
 - EMA 21 tidak berada signifikan di bawah EMA 55.
 - Harga tidak lebih dari 1,5% di atas EMA 21.
 - Salah satu dari tiga candle terakhir menguji area EMA 21.
@@ -139,10 +141,11 @@ Setup LONG membutuhkan:
 - Close kembali di sekitar/atas EMA 21.
 - RSI berada pada rentang 40-68.
 - Volume minimal 0,8x volume SMA 20.
+- ADX minimal 25.
 
 Setup SHORT memakai kondisi kebalikan arah, dengan RSI 32-60 serta upper-wick atau bearish-engulfing sebagai rejection.
 
-Skor dasar setup valid adalah 80. Bonus diberikan untuk wick kuat, engulfing, volume tinggi, dan keselarasan trend 1H. Bot memilih signal valid dengan skor tertinggi dari seluruh kandidat.
+Skor sekarang dibangun dari nol berdasarkan kualitas wick, engulfing, volume, RSI, ADX, trend 1H, BTC, dan BTC.D. Minimum entry adalah 85. Pemilihan kandidat memakai 90% skor signal dan 10% kualitas scanner, sehingga likuiditas tidak lagi diabaikan.
 
 #### BTC dominance market regime
 
@@ -154,9 +157,9 @@ Bot memakai `BTCDOMUSDT` dari Binance sebagai proxy relative strength BTC terhad
 | Bearish: close < EMA 21 < EMA 55 dan momentum turun | Altcoin menguat relatif terhadap BTC | Block ALT SHORT, bonus +5 untuk ALT LONG |
 | Neutral/tidak tersedia | Regime belum jelas | Tidak memblokir entry |
 
-Analisis memakai candle 1H yang sudah close dan di-cache selama 60 detik. Jika BTCDOMUSDT tidak tersedia pada exchange/testnet, bot menggunakan kondisi neutral (`fail-open`) dan tidak memaksa entry atau exit.
+Analisis memakai candle 1H yang sudah close dan di-cache selama 60 detik. Filter tambahan memakai trend absolut BTCUSDT 1H: alt-long diblokir saat BTC bearish dan alt-short diblokir saat BTC bullish.
 
-> Signal dihitung menggunakan candle terakhir dari respons OHLCV. Candle tersebut dapat masih berjalan dan nilainya dapat berubah sebelum candle close.
+> Seluruh keputusan entry, macro, dan reversal memakai candle yang sudah close. Candle aktif hanya dipakai sebagai referensi harga order.
 
 ### 4. Dynamic limit entry
 
@@ -173,7 +176,7 @@ Jika suggested entry tidak tersedia, bot memakai tiered fixed offset:
 | High conviction | >= 80 | 0,10% | 10 menit |
 | Normal conviction | < 80 | 0,35% | 15 menit |
 
-Dengan strategi saat ini, setup valid dimulai dari skor 80 sehingga tier normal umumnya tidak terpakai.
+Entry baru hanya dikirim jika skor akhir minimal 85.
 
 ### 5. Sizing dan placement
 
@@ -181,35 +184,36 @@ Sebelum entry, bot:
 
 1. Memastikan state tidak memiliki posisi atau pending order.
 2. Memeriksa posisi untuk symbol tersebut langsung di Binance.
-3. Mengatur isolated margin dan leverage 3x.
-4. Menghitung exposure cap dari 35% saldo tersedia x leverage.
+3. Mengatur isolated margin dan leverage 2x.
+4. Menghitung exposure cap dari 25% saldo tersedia x leverage.
 5. Menghitung risk cap dari jarak adaptive stop dan risk budget wallet.
 6. Menyesuaikan harga dan amount dengan precision serta minimum market.
 7. Membuat `newClientOrderId` ber-prefix `bf_` agar outcome timeout dapat direkonsiliasi tanpa duplicate order.
 8. Mengirim limit GTD dengan expiry exchange-side dan menyimpannya sebagai pending order.
 9. Mengaktifkan `countdownCancelAll` 120 detik untuk simbol entry dan me-refresh-nya setiap 30 detik selama order pending.
+10. Merevalidasi setup setiap 30 detik; pending limit dibatalkan jika signal tidak lagi valid.
 
 ### Contoh sizing modal $35
 
 Rumus sizing saat ini:
 
 ```text
-exposure cap = available balance x 35% x leverage
+exposure cap = available balance x 25% x leverage
 risk budget  = available balance x 1%
 risk cap     = risk budget / stop distance
 notional     = min(exposure cap, risk cap)
 ```
 
-Dengan saldo tersedia $35 dan leverage 3x:
+Dengan saldo tersedia $35 dan leverage 2x:
 
 ```text
-exposure cap                  = $35 x 35% x 3 = $36,75
+exposure cap                  = $35 x 25% x 2 = $17,50
 risk budget                   = $35 x 1%       = $0,35
 notional jika stop berjarak 5% = $0,35 / 5%    = $7,00
-initial margin                = $7,00 / 3       = sekitar $2,33
+initial margin                = $7,00 / 2       = sekitar $3,50
 ```
 
-Pada contoh stop 5%, risk cap lebih kecil sehingga bot membuka exposure sekitar **$7**, bukan $36,75. Jika stop hanya 2%, risk cap menjadi $17,50. Konfigurasi 35% sekarang berfungsi sebagai batas maksimum exposure, bukan target size yang harus selalu dipakai.
+Pada contoh stop 5%, risk cap lebih kecil sehingga bot membuka exposure sekitar **$7**, bukan $17,50. Jika stop hanya 2%, risk cap dan exposure cap sama-sama $17,50. Konfigurasi 25% berfungsi sebagai batas maksimum exposure, bukan target size yang harus selalu dipakai.
 
 Minimum order futures bukan angka universal $25. Nilainya berbeda per symbol dan dapat berubah. Bot membaca `limits.amount.min` dan `limits.cost.min` dari market CCXT sebelum mengirim order. Sebagai contoh, spesifikasi Binance menyebut BTCUSDT memiliki minimum notional $100; target $36,75 tidak cukup untuk BTCUSDT, tetapi dapat cukup untuk symbol dengan minimum notional lebih rendah. Nilai aktual exchange tetap menjadi sumber kebenaran.
 
@@ -250,9 +254,17 @@ Initial hard-stop dihitung dari candle 15m yang sudah closed:
 - Jarak stop dijepit pada minimum 1% dan maksimum 5% dari entry.
 - Jika data indikator gagal diperoleh, fallback tetap berada pada batas maksimum 5%, bukan kembali ke -25%.
 
-Ukuran order memakai dua batas sekaligus. Exposure tidak boleh melebihi `BALANCE_USAGE × LEVERAGE`, dan estimasi rugi pada initial stop tidak boleh melebihi `RISK_PER_TRADE_PERCENT` dari available wallet. Default risk budget adalah 1%. Akibatnya, size aktual dapat lebih kecil dari 35% margin ketika stop pasar cukup lebar.
+Ukuran order memakai dua batas sekaligus. Exposure tidak boleh melebihi `BALANCE_USAGE × LEVERAGE`, dan estimasi rugi pada initial stop tidak boleh melebihi `RISK_PER_TRADE_PERCENT` dari available wallet. Default risk budget adalah 1%. Akibatnya, size aktual dapat lebih kecil dari 25% margin ketika stop pasar cukup lebar.
 
 Stop memakai Binance Algo Order reduce-only sehingga tetap tersedia ketika bot, laptop, atau koneksi offline. ACK stop diberi verification grace 8 detik untuk menghindari duplikasi akibat eventual consistency. Setelah grace, bot mengadopsi stop aktif dan menghapus duplicate STOP Algo Order pada simbol/sisi posisi yang sama.
+
+Profit-taking memakai initial risk (`R`) dari jarak entry ke hard-stop:
+
+- TP1: saat mencapai `min(1R, +1%)`, close 50% ukuran awal dan naikkan hard-stop sisa posisi ke +0,22%.
+- TP2: saat mencapai `min(2R, +2%)`, close lagi 25% ukuran awal.
+- Early BEP: pada profit harga +0,8%, hard-stop minimal dinaikkan ke +0,22%.
+- Time stop: setelah 90 menit, posisi ditutup jika peak profit belum mencapai 0,5R.
+- Semua partial close memakai reduce-only; stop sisa posisi dibuat sebelum stop lama dibatalkan.
 
 Price-based trailing default:
 
@@ -283,18 +295,17 @@ Stagnation force-close tersedia di kode tetapi default-nya nonaktif. Posisi dibi
 
 Reversal guard mengevaluasi timeframe 15m setiap 30 detik.
 
-LONG ditutup jika salah satu kondisi berikut terkonfirmasi:
+Reversal memakai dua tahap berdasarkan candle 15m yang sudah close:
 
-- Candle sebelumnya close di bawah EMA 55.
-- Harga terbaru lebih dari 0,5% di bawah EMA 55.
-- EMA 21 melakukan dead cross terhadap EMA 55.
+- Close menembus EMA21: kurangi 50% posisi sekali dan resize hard-stop.
+- Close menembus EMA55 atau EMA21/55 cross: tutup seluruh sisa posisi.
 
 SHORT memakai kondisi kebalikan. Ketika reversal terkonfirmasi, bot mengirim reduce-only market order sementara hard-stop tetap aktif. Stop baru dibersihkan setelah market-close mendapat ACK, sehingga tidak ada celah posisi tanpa proteksi.
 
 Untuk posisi altcoin, ada exit plan tambahan menggunakan dua candle BTCDOM 15m yang sudah close:
 
-- ALT LONG ditutup jika dua candle mengonfirmasi struktur bullish BTC.D (`close > EMA 21 > EMA 55`) dan momentum naik.
-- ALT SHORT ditutup jika dua candle mengonfirmasi struktur bearish BTC.D (`close < EMA 21 < EMA 55`) dan momentum turun.
+- ALT LONG dikurangi 50% jika dua candle mengonfirmasi struktur bullish BTC.D (`close > EMA 21 > EMA 55`) dan momentum naik.
+- ALT SHORT dikurangi 50% jika dua candle mengonfirmasi struktur bearish BTC.D (`close < EMA 21 < EMA 55`) dan momentum turun.
 - Reversal harga symbol tetap memiliki prioritas lebih tinggi.
 - Posisi BTC tidak ditutup hanya karena perubahan BTC.D.
 - Kegagalan mengambil data BTC.D tidak memicu close.
@@ -305,11 +316,13 @@ Setelah posisi ditutup, bot mencoba mengambil realized PnL dan komisi dari trade
 
 | Kondisi | Durasi cooldown |
 |---|---:|
-| Setelah trade selesai | 30 menit global |
+| Setelah trade selesai | 20 menit global |
 | Symbol yang baru ditutup | 60 menit |
 | Pending order timeout/cancel | 1 menit global |
-| Dua loss beruntun | 2x cooldown dasar |
-| Tiga loss beruntun | Pause 120 menit, lalu counter di-reset |
+| Satu atau dua loss beruntun | 2x cooldown dasar |
+| Tiga loss beruntun | Pause 30 menit, lalu counter di-reset |
+
+Circuit breaker tambahan menghentikan entry baru selama 360 menit jika loss harian mencapai -2R atau profit factor enam hingga sepuluh trade terakhir turun di bawah 0,8. Win kecil di bawah +0,25R tidak mereset loss streak.
 
 ## State persistence
 
@@ -334,9 +347,9 @@ Semua parameter strategi dan operasional berada di `config.py`.
 
 | Konfigurasi | Default | Keterangan |
 |---|---:|---|
-| `LEVERAGE` | 3 | Leverage futures |
+| `LEVERAGE` | 2 | Leverage futures |
 | `MARGIN_MODE` | isolated | Mode margin |
-| `BALANCE_USAGE` | 0.35 | Bagian saldo tersedia untuk sizing |
+| `BALANCE_USAGE` | 0.25 | Bagian saldo tersedia untuk sizing |
 | `RISK_PER_TRADE_PERCENT` | 1.0 | Maksimum estimasi rugi initial stop terhadap wallet |
 | `INITIAL_STOP_ATR_MULTIPLIER` | 1.5 | Jarak ATR dasar hard-stop |
 | `INITIAL_STOP_ATR_BUFFER` | 0.25 | Buffer di luar struktur EMA/swing |
@@ -350,15 +363,16 @@ Semua parameter strategi dan operasional berada di `config.py`.
 | `ENTRY_DEADMAN_COUNTDOWN_MS` | 120000 | Countdown jika heartbeat bot berhenti |
 | `MANDATORY_STOP_PROTECTION` | true | Posisi wajib memiliki stop aktif |
 | `FAIL_CLOSE_IF_STOP_UNPROTECTED` | true | Market-close jika stop tidak dapat dipasang |
-| `MIN_WALLET_BALANCE_USDT` | 5 | Saldo minimum untuk scan/entry |
-| `SIGNAL_MIN_SCORE` | 75 | Minimum score global |
+| `MIN_WALLET_BALANCE_USDT` | 35 | Saldo minimum untuk scan/entry |
+| `SIGNAL_MIN_SCORE` | 85 | Minimum score global |
+| `NEUTRAL_REGIME_MIN_SCORE` | 92 | Minimum score saat trend 1H neutral |
 | `TRADING_TIMEFRAME` | 15m | Timeframe setup |
 | `HIGHER_TIMEFRAME` | 1h | Timeframe trend makro |
 | `BTCDOM_TIMEFRAME` | 1h | Regime BTC.D untuk entry altcoin |
 | `BTCDOM_EXIT_TIMEFRAME` | 15m | BTC.D untuk exit reversal |
 | `BTCDOM_STRICT_ENTRY_FILTER` | true | Block entry alt yang melawan BTC.D |
 | `BTCDOM_EXIT_CONFIRMATION_CANDLES` | 2 | Closed candle untuk konfirmasi exit |
-| `SCANNER_TOP_N` | 50 | Jumlah market berdasarkan volume |
+| `SCANNER_TOP_N` | 300 | Jumlah market berdasarkan volume |
 | `CRYPTO_ONLY_SCANNER` | true | Hanya underlying type `COIN` |
 | `MIN_24H_CHANGE_PERCENT` | 1.0 | Volatilitas minimum |
 | `MAX_SPREAD_PERCENT` | 0.05 | Spread maksimum |
@@ -393,6 +407,7 @@ Runtime files yang dibuat otomatis dan tidak di-commit:
 ```text
 bot.pid
 bot_state.json
+strategy_overrides.json
 logs/bot_YYYY-MM-DD.log
 logs/trades_YYYY-MM-DD.log
 ```
@@ -402,7 +417,7 @@ logs/trades_YYYY-MM-DD.log
 Sebelum mode live, perhatikan hal berikut:
 
 1. Automated test menggunakan fake exchange; belum ada integration test Binance Futures Testnet atau replay/backtest bawaan.
-2. Dashboard belum memiliki autentikasi dan default bind ke seluruh interface.
+2. Dashboard memakai session login dan rate-limit sederhana, tetapi default bind tetap ke seluruh interface. Gunakan firewall/VPN/reverse proxy HTTPS pada VPS publik.
 3. Dependensi belum seluruhnya dipin ke versi exact sehingga perubahan CCXT/Binance dapat memengaruhi perilaku API.
 4. `countdownCancelAll` berlaku ke seluruh regular open order pada simbol yang sama. Gunakan akun/sub-account khusus dan jangan menaruh order manual pada simbol yang sedang dipakai bot.
 5. Risk cap adalah estimasi berdasarkan harga stop; slippage, gap, fee, dan masalah likuiditas dapat membuat kerugian aktual lebih besar.
@@ -420,6 +435,21 @@ Sebelum mode live, perhatikan hal berikut:
 - Uji restart ketika ada pending order dan ketika ada posisi aktif.
 - Uji full fill, partial fill, timeout, network error, stop trigger, dan reversal close.
 - Pantau log serta posisi Binance secara langsung selama tahap validasi.
+
+## Tindak lanjut audit: exit, ledger, konfigurasi
+
+- Partial-close menyimpan `exit_intent` sebelum submit dan memulihkannya melalui
+  client order ID. Jangan menghapus state saat intent belum terselesaikan.
+- PnL trade baru berstatus `estimated` sampai lifecycle fills, komisi dan funding
+  direkonsiliasi ketika bot flat. `estimated_fx` berarti kurs biaya non-USDT
+  memakai estimasi historical 1m close. Dashboard menampilkan status ini.
+- Perubahan admin berlaku mulai siklus bot berikutnya dengan snapshot konsisten,
+  termasuk dashboard proses terpisah yang memakai file override sama. Jalankan
+  hanya satu proses bot dan satu admin writer.
+- `TP_PRICE_CAP_ENABLED` tetap ON (perilaku lama). OFF memakai pure-R; belum
+  terbukti lebih baik tanpa pengujian historis.
+- Evaluasi offline: lihat [EXIT_EVALUATION.md](EXIT_EVALUATION.md).
+  Status implementasi dan batasan: [STRATEGY_AUDIT.md](STRATEGY_AUDIT.md).
 
 ## Disclaimer
 

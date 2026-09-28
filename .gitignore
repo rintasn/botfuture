@@ -36,6 +36,7 @@ share/python-wheels/
 
 # Runtime Data & Bot State
 bot_state.json
+strategy_overrides.json
 bot.pid
 logs/
 *.log

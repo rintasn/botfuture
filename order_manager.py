@@ -13,9 +13,12 @@ agar tidak terjadi state inconsistency.
 
 import time
 import threading
+import uuid
+from datetime import datetime
 import ccxt
-import config
+from runtime_config import config
 from logger_setup import logger
+from trade_ledger import TradeLedger
 
 
 class OrderManager:
@@ -28,6 +31,28 @@ class OrderManager:
         self.exchange = exchange
         self.state = state_manager
         self._stop_lock = threading.RLock()
+        self._last_ledger_check = 0
+
+    def reconcile_trade_ledger(self):
+        """Read-only, rate-bounded accounting catch-up while flat."""
+        now = time.time()
+        if now - self._last_ledger_check < 60:
+            return
+        self._last_ledger_check = now
+        records = self.state.get_state().get("trade_history", [])
+        eligible = [t for t in records if t.get("pnl_status") in ("estimated", "pending")
+                    and now - float(t.get("ledger_last_attempt", 0)) >= 300
+                    and now - datetime.fromisoformat(t["close_time"]).timestamp() >= 120]
+        if not eligible:
+            return
+        trade = min(eligible, key=lambda t: float(t.get("ledger_last_attempt", 0)))
+        try:
+            ledger = TradeLedger(self.exchange).reconcile(trade)
+        except Exception as exc:
+            self.state.update_trade_ledger(trade.get("order_id"), trade["close_time"], error=exc)
+            logger.warning("Ledger remains estimated for %s: %s", trade["symbol"], exc)
+        else:
+            self.state.update_trade_ledger(trade.get("order_id"), trade["close_time"], ledger=ledger)
 
     @staticmethod
     def _client_order_id(symbol):
@@ -298,7 +323,7 @@ class OrderManager:
     
     def place_entry_order(
         self, symbol, signal, current_price, score=None, suggested_price=None,
-        initial_stop_plan=None,
+        initial_stop_plan=None, signal_context=None,
     ):
         """
         Place limit order untuk entry posisi dengan Dynamic Confluence Limit & Tiered Fallback.
@@ -395,7 +420,7 @@ class OrderManager:
             
             # Hitung jumlah kontrak
             balance = self.get_available_balance()
-            if balance <= config.MIN_WALLET_BALANCE_USDT:
+            if balance < config.MIN_WALLET_BALANCE_USDT:
                 logger.error(f"❌ Balance {balance:.2f} USDT dibawah batas aman {config.MIN_WALLET_BALANCE_USDT} USDT.")
                 return None
             
@@ -491,6 +516,7 @@ class OrderManager:
                     good_till_date=good_till_date,
                     status_unknown=True,
                     initial_stop_plan=initial_stop_plan,
+                    entry_signal_snapshot=signal_context,
                 )
                 self.state.set_connection_status("api_error", create_error)
                 return {"id": None, "clientOrderId": client_order_id, "status": "unknown"}
@@ -509,6 +535,7 @@ class OrderManager:
                 client_order_id=client_order_id,
                 good_till_date=good_till_date,
                 initial_stop_plan=initial_stop_plan,
+                entry_signal_snapshot=signal_context,
             )
             self.refresh_entry_deadman(symbol, force=True)
             
@@ -541,6 +568,7 @@ class OrderManager:
             amount=filled_amount,
             order_id=order_id,
             initial_stop_plan=pending.get("initial_stop_plan"),
+            entry_signal_snapshot=pending.get("entry_signal_snapshot"),
         )
         if clear_pending:
             self.state.clear_pending_order()
@@ -899,6 +927,8 @@ class OrderManager:
         prefix clientOrderId milik bot.
         """
         logger.info("🔄 Startup reconciliation: positions, entries, dan stop protection...")
+        if not self.recover_exit_intent():
+            return {"status": "error", "error": "Exit intent unresolved; preserve exchange protection and reconcile client ID"}
         try:
             raw_positions = self.exchange.fetch_positions()
             positions = []
@@ -949,11 +979,16 @@ class OrderManager:
             if local_position:
                 # Posisi ditutup manual/oleh stop ketika bot offline. Jangan menganggap
                 # kegagalan API sebagai flat: seluruh fetch di atas sudah sukses.
+                remaining = float(local_position.get("amount") or 0)
+                estimated = self.get_realized_pnl(
+                    local_position["symbol"], local_position["side"],
+                    float(local_position["entry_price"]), remaining,
+                ) if remaining > 0 else 0.0
                 self.state.clear_position(
-                    pnl=0.0,
+                    pnl=estimated,
                     reason="startup_exchange_flat",
                     start_cooldown=False,
-                    record_history=False,
+                    record_history=True,
                 )
 
             if local_pending:
@@ -1120,7 +1155,7 @@ class OrderManager:
                 close_side = "sell" if side == "long" else "buy"
                 closing_trades = [
                     t for t in trades 
-                    if t.get("side") == close_side and float(t.get("info", {}).get("realizedPnl", 0)) != 0
+                    if not close_order_id and t.get("side") == close_side and float(t.get("info", {}).get("realizedPnl", 0)) != 0
                 ]
                 if closing_trades:
                     last_close_order_id = closing_trades[-1].get("order") or closing_trades[-1].get("info", {}).get("orderId")
@@ -1138,7 +1173,7 @@ class OrderManager:
 
                 # 3. Fallback ke harga trade terakhir jika realizedPnl tidak ditemukan
                 trade_price = float(trades[-1].get("price", 0))
-                if trade_price > 0:
+                if not close_order_id and trade_price > 0:
                     fallback_close_price = trade_price
         except Exception as e:
             logger.warning(f"⚠️ Gagal fetch trades dari exchange: {e}")
@@ -1164,11 +1199,75 @@ class OrderManager:
                 
         return 0.0
 
+    def reduce_position(self, symbol, side, amount, reason="partial_exit", flag=None):
+        """Kurangi posisi dengan reduce-only market tanpa mengakhiri trade."""
+        if self.state.get_exit_intent():
+            self.recover_exit_intent()
+            return None
+        pos = self.state.get_position()
+        if not pos or amount <= 0:
+            return None
+        amount = min(float(amount), float(pos.get("amount", 0)))
+        amount = float(self.exchange.amount_to_precision(symbol, amount))
+        if amount <= 0:
+            return None
+        close_side = "sell" if side == "long" else "buy"
+        try:
+            client_id = "bf_exit_" + uuid.uuid4().hex[:24]
+            self.state.begin_exit_intent({
+                "client_id": client_id, "symbol": symbol, "side": side,
+                "amount": amount, "before_amount": float(pos["amount"]),
+                "entry_price": float(pos["entry_price"]), "reason": reason,
+                "entry_order_id": pos.get("order_id"),
+                "flag": flag, "created_ms": int(time.time() * 1000),
+            })
+            order = self.exchange.create_order(
+                symbol=symbol, type="market", side=close_side, amount=amount,
+                params={"reduceOnly": True, "newClientOrderId": client_id},
+            )
+            return order if self.recover_exit_intent() else None
+        except Exception as e:
+            logger.error(f"Gagal partial exit {symbol}: {e}")
+            self.state.set_connection_status("api_error", e)
+            return None
+
+    def recover_exit_intent(self):
+        """Query the original client ID, NEVER resubmit an ambiguous partial exit."""
+        intent = self.state.get_exit_intent()
+        if not intent:
+            return True
+        try:
+            order = self._fetch_order(intent["symbol"], client_order_id=intent["client_id"])
+            if order["status"] not in ("closed", "canceled", "expired", "rejected"):
+                return False
+            filled = float(order.get("filled") or 0)
+            if filled < 0 or filled > intent["amount"] + 1e-9:
+                raise ValueError("Unexpected exit fill quantity")
+            price = float(order.get("average") or 0)
+            if filled > 0 and price <= 0:
+                return False
+            pnl = 0.0
+            if filled > 0:
+                pnl = self.get_realized_pnl(
+                    intent["symbol"], intent["side"], intent["entry_price"], filled,
+                    fallback_close_price=price, close_order_id=order["id"],
+                )
+            self.state.finish_exit_intent(intent["client_id"], order, pnl)
+            return True
+        except Exception as exc:
+            # Even OrderNotFound can mean a delayed/ambiguous submission.
+            self.state.set_connection_status("api_error", exc)
+            logger.error("Exit intent unresolved; no resubmission: %s", exc)
+            return False
+
     def close_position(self, symbol, side, amount, reason="manual"):
         """
         Close posisi aktif via MARKET order.
         Dengan retry mechanism jika gagal.
         """
+        if self.state.get_exit_intent():
+            self.recover_exit_intent()
+            return None
         for attempt in range(self.MAX_RETRIES):
             try:
                 close_side = "sell" if side == "long" else "buy"
@@ -1188,6 +1287,12 @@ class OrderManager:
                 )
                 
                 close_order_id = order.get("id") if order else None
+                # An order acknowledgement is not proof that the position is flat.
+                actual_result = self.get_position_status(symbol)
+                if actual_result["status"] != "empty":
+                    self.state.set_connection_status("api_error")
+                    logger.error("Close not confirmed flat; preserving position and exchange stops.")
+                    return None
                 close_price = order.get("average") or order.get("price", 0)
                 if not close_price or float(close_price) <= 0:
                     close_price = self.get_current_price(symbol)
@@ -1247,17 +1352,19 @@ class OrderManager:
                     continue
                     
             except ccxt.NetworkError as e:
-                logger.error(
-                    f"❌ Network error closing position (attempt {attempt + 1}): {e}"
-                )
-                if attempt < self.MAX_RETRIES - 1:
-                    time.sleep(self.RETRY_DELAY * (attempt + 1))
-                    continue
+                # Execution may have succeeded. Never retry blindly in this call.
+                self.state.set_connection_status("api_error")
+                logger.error(f"Ambiguous close response; reconcile before retry: {e}")
+                return None
                     
             except ccxt.ExchangeError as e:
                 error_msg = str(e).lower()
                 if "position side does not match" in error_msg or \
                    "reduce only" in error_msg:
+                    if self.get_position_status(symbol)["status"] != "empty":
+                        self.state.set_connection_status("api_error")
+                        logger.error("Close rejected with position not confirmed empty; retaining stops.")
+                        return None
                     logger.warning(f"⚠️ Position mungkin sudah closed: {e}")
                     self.cancel_all_orders(symbol)
                     pos = self.state.get_position()

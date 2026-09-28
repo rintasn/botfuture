@@ -6,7 +6,8 @@ Multi-layer filtering: volume → volatilitas → spread → blacklist.
 """
 
 import ccxt
-import config
+import math
+from runtime_config import config
 from logger_setup import logger
 
 
@@ -68,31 +69,39 @@ class MarketScanner:
                 if base_symbol in config.BLACKLIST_COINS:
                     continue
                 
+                # Liquidity and quoted spread must be observable and finite.
+                try:
+                    quote_volume = float(ticker.get("quoteVolume") or 0)
+                    bid = float(ticker.get("bid") or 0)
+                    ask = float(ticker.get("ask") or 0)
+                    change_pct = abs(float(ticker.get("percentage") or 0))
+                except (TypeError, ValueError):
+                    continue
+                if not all(math.isfinite(v) for v in (quote_volume, bid, ask, change_pct)):
+                    continue
+                if quote_volume < config.MIN_QUOTE_VOLUME_USDT or bid <= 0 or ask <= bid:
+                    continue
+
                 # Filter: minimum price change 24h (volatilitas)
-                change_pct = abs(ticker.get("percentage") or 0)
                 if change_pct < config.MIN_24H_CHANGE_PERCENT:
                     continue
                 
                 # Filter: spread check
-                bid = ticker.get("bid") or 0
-                ask = ticker.get("ask") or 0
-                spread_pct = 0
-                if bid > 0 and ask > 0:
-                    spread_pct = ((ask - bid) / bid) * 100
-                    if spread_pct > config.MAX_SPREAD_PERCENT:
-                        continue
+                spread_pct = ((ask - bid) / bid) * 100
+                if spread_pct > config.MAX_SPREAD_PERCENT:
+                    continue
                 
-                # Hitung skor berdasarkan kombinasi volume & volatilitas
-                volume_score = min(ticker.get("quoteVolume", 0) / 1e9, 1.0) * 50
-                volatility_score = min(change_pct / 10.0, 1.0) * 30
-                spread_score = 20 if spread_pct == 0 else max(0, (config.MAX_SPREAD_PERCENT - spread_pct) / config.MAX_SPREAD_PERCENT) * 20
+                # Change 24h remains an eligibility check, not a momentum bonus:
+                # ranking a larger 24h move higher chased extended markets.
+                volume_score = min(quote_volume / 1e9, 1.0) * 70
+                spread_score = max(0, (config.MAX_SPREAD_PERCENT - spread_pct) / config.MAX_SPREAD_PERCENT) * 30
                 
-                total_score = volume_score + volatility_score + spread_score
+                total_score = volume_score + spread_score
                 
                 candidates.append({
                     "symbol": symbol,
                     "price": ticker.get("last", 0),
-                    "quote_volume": ticker.get("quoteVolume", 0),
+                    "quote_volume": quote_volume,
                     "change_24h": ticker.get("percentage", 0),
                     "spread_pct": round(spread_pct, 4),
                     "bid": bid,

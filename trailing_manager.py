@@ -2,7 +2,7 @@
 
 from datetime import datetime
 import ccxt
-import config
+from runtime_config import config
 from logger_setup import logger
 
 
@@ -71,6 +71,45 @@ class TrailingManager:
             
         steps = int((profit_pct - first_cp) // step)
         return first_cp + (steps * step)
+
+    def _replace_stop(self, symbol, side, amount, target_price, checkpoint):
+        """Pasang stop sisa posisi dahulu, baru batalkan stop lama."""
+        old_stop = self.state.get_trailing_stop()
+        if old_stop and old_stop.get("stop_price"):
+            old_price = float(old_stop["stop_price"])
+            target_price = max(old_price, target_price) if side == "long" else min(old_price, target_price)
+        new_stop = self.order_mgr.place_stop_order(symbol, side, amount, target_price)
+        if not new_stop:
+            return False
+        if old_stop and old_stop.get("order_id") and str(old_stop["order_id"]) != str(new_stop["id"]):
+            canceled = self.order_mgr.cancel_stop_order(symbol, old_stop["order_id"])
+            if canceled == "triggered":
+                self.order_mgr.cancel_stop_order(symbol, new_stop["id"])
+                return False
+        self.state.set_trailing_stop(
+            new_stop["id"], target_price, checkpoint, amount=amount,
+        )
+        return True
+
+    def reduce_and_resize_stop(self, symbol, side, amount, reason, flag, lock_profit_pct=None):
+        """Partial close lalu sesuaikan hard-stop ke ukuran posisi tersisa."""
+        if not self.order_mgr.reduce_position(symbol, side, amount, reason=reason, flag=flag):
+            return False
+        pos = self.state.get_position() or {}
+        remaining = float(pos.get("amount", 0) or 0)
+        if remaining <= 0:
+            return True
+        old_stop = self.state.get_trailing_stop() or {}
+        target = float(old_stop.get("stop_price") or 0)
+        if lock_profit_pct is not None:
+            lock_price = self.calculate_stop_price(float(pos["entry_price"]), lock_profit_pct, side)
+            target = max(target, lock_price) if side == "long" else (min(target, lock_price) if target else lock_price)
+        if target <= 0:
+            return False
+        return self._replace_stop(
+            symbol, side, remaining, target,
+            max(float(self.state.get_current_checkpoint() or 0), float(lock_profit_pct or 0)),
+        )
     
     def update(self, symbol, entry_price, current_price, side, amount):
         """
@@ -115,6 +154,78 @@ class TrailingManager:
                 result["action"] = "protection_unknown"
                 return result
         
+        # Partial TP berbasis initial risk (R), bukan persentase profit tunggal.
+        risk_pct = float(pos.get("initial_risk_pct", 0) or 0)
+        if risk_pct <= 0:
+            risk_pct = float((pos.get("initial_stop_plan") or {}).get("distance_pct") or 0)
+        initial_amount = float(pos.get("initial_amount") or amount)
+        if getattr(config, "PARTIAL_TP_ENABLED", True) and risk_pct > 0:
+            tp1_trigger = min(
+                risk_pct * float(getattr(config, "TP1_R_MULTIPLE", 1.0)),
+                float(getattr(config, "TP1_MAX_PRICE_PERCENT", 1.0)) if config.TP_PRICE_CAP_ENABLED else float("inf"),
+            )
+            if not pos.get("tp1_done") and profit_pct >= tp1_trigger:
+                reduce_amount = min(
+                    float(pos.get("amount", amount)),
+                    initial_amount * float(getattr(config, "TP1_CLOSE_PERCENT", 50)) / 100,
+                )
+                if self.reduce_and_resize_stop(
+                    symbol, side, reduce_amount, "tp1_capped" if config.TP_PRICE_CAP_ENABLED else "tp1_R", "tp1_done",
+                    lock_profit_pct=float(getattr(config, "EARLY_BEP_STOP_PERCENT", 0.22)),
+                ):
+                    result["action"] = "partial_tp1"
+                    return result
+                result["action"] = "partial_tp1_pending"
+                return result
+
+            pos = self.state.get_position() or pos
+            tp2_trigger = min(
+                risk_pct * float(getattr(config, "TP2_R_MULTIPLE", 2.0)),
+                float(getattr(config, "TP2_MAX_PRICE_PERCENT", 2.0)) if config.TP_PRICE_CAP_ENABLED else float("inf"),
+            )
+            if pos.get("tp1_done") and not pos.get("tp2_done") and profit_pct >= tp2_trigger:
+                reduce_amount = min(
+                    float(pos.get("amount", amount)),
+                    initial_amount * float(getattr(config, "TP2_CLOSE_PERCENT", 25)) / 100,
+                )
+                if self.reduce_and_resize_stop(
+                    symbol, side, reduce_amount, "tp2_capped" if config.TP_PRICE_CAP_ENABLED else "tp2_R", "tp2_done",
+                    lock_profit_pct=float(getattr(config, "TRAILING_FIRST_STOP_PERCENT", 0.3)),
+                ):
+                    result["action"] = "partial_tp2"
+                    return result
+                result["action"] = "partial_tp2_pending"
+                return result
+
+        # Early BEP menangkap profit yang pada data historis sering kembali rugi.
+        if (
+            getattr(config, "EARLY_BEP_ENABLED", True)
+            and profit_pct >= float(getattr(config, "EARLY_BEP_TRIGGER_PERCENT", 0.8))
+        ):
+            bep_pct = float(getattr(config, "EARLY_BEP_STOP_PERCENT", 0.22))
+            bep_price = self.calculate_stop_price(entry_price, bep_pct, side)
+            current_stop_price = float((old_stop or {}).get("stop_price") or 0)
+            improves = (
+                not current_stop_price
+                or (side == "long" and bep_price > current_stop_price)
+                or (side == "short" and bep_price < current_stop_price)
+            )
+            if improves and self._replace_stop(symbol, side, amount, bep_price, 0.5):
+                result.update({"action": "early_bep", "checkpoint": 0.5, "stop_price": bep_price})
+                return result
+
+        # Time stop: setup yang gagal mencapai 0.5R dalam 90m tidak lagi ditahan.
+        if getattr(config, "TIME_STOP_ENABLED", True) and risk_pct > 0:
+            try:
+                elapsed = (datetime.now() - datetime.fromisoformat(pos["entry_time"])).total_seconds() / 60
+            except (KeyError, TypeError, ValueError):
+                elapsed = 0
+            mfe_limit = risk_pct * float(getattr(config, "TIME_STOP_MAX_MFE_R", 0.5))
+            if elapsed >= float(getattr(config, "TIME_STOP_MINUTES", 90)) and float(pos.get("highest_profit_pct", 0)) < mfe_limit:
+                if self.order_mgr.close_position(symbol, side, amount, reason="time_stop_no_momentum"):
+                    result["action"] = "time_stop_closed"
+                    return result
+
         # 3. Hitung checkpoint tertinggi yang sudah tercapai
         current_checkpoint = self.state.get_current_checkpoint() or 0
         highest_cp = self.get_highest_reached_checkpoint(profit_pct)
@@ -153,7 +264,7 @@ class TrailingManager:
                 )
                 
                 if stop_order:
-                    if old_stop and old_stop.get("order_id"):
+                    if old_stop and old_stop.get("order_id") and str(old_stop["order_id"]) != str(stop_order["id"]):
                         cancel_result = self.order_mgr.cancel_stop_order(symbol, old_stop["order_id"])
                         if cancel_result == "triggered":
                             self.order_mgr.cancel_stop_order(symbol, stop_order["id"])

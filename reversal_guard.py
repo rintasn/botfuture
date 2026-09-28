@@ -8,7 +8,7 @@ Otomatis close posisi saat signal berbalik arah.
 """
 
 import time
-import config
+from runtime_config import config
 from logger_setup import logger
 
 
@@ -67,6 +67,25 @@ class ReversalGuard:
                 f"{reversal['signal']} | Details: {reversal['details']}"
             )
             
+            if reversal.get("severity") == "reduce":
+                if pos.get("defensive_reduction_done"):
+                    return result
+                reduce_amount = float(pos["amount"]) * float(
+                    getattr(config, "REVERSAL_PARTIAL_CLOSE_PERCENT", 50)
+                ) / 100
+                reduced = self.trailing_mgr.reduce_and_resize_stop(
+                    symbol, side, reduce_amount,
+                    reason=f"defensive_reversal:{reversal['signal']}",
+                    flag="defensive_reduction_done",
+                    lock_profit_pct=None,
+                )
+                if reduced:
+                    result.update({
+                        "action": "reduced", "reason": reversal["signal"],
+                        "details": reversal["details"],
+                    })
+                return result
+
             # Market-close dahulu sementara hard-stop exchange tetap aktif.
             # close_position membersihkan stop hanya setelah close mendapat ACK.
             close_result = self.order_mgr.close_position(
