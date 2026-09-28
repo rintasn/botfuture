@@ -6,6 +6,7 @@ Memungkinkan recovery setelah restart tanpa kehilangan informasi posisi.
 """
 
 import os
+import errno
 import json
 import time
 import copy
@@ -14,6 +15,9 @@ import threading
 from datetime import datetime, timedelta
 from logger_setup import logger
 from runtime_config import config
+
+
+_state_file_io_lock = threading.RLock()
 
 
 class StateManager:
@@ -55,8 +59,9 @@ class StateManager:
         """Load state dari file JSON."""
         if os.path.exists(self.state_file):
             try:
-                with open(self.state_file, "r") as f:
-                    state = json.load(f)
+                with _state_file_io_lock:
+                    with open(self.state_file, "r") as f:
+                        state = json.load(f)
                 
                 # Pastikan key baru ada (backward compatibility)
                 default = self._default_state()
@@ -95,7 +100,7 @@ class StateManager:
         """Simpan state secara atomic agar JSON tidak pernah terbaca setengah."""
         temp_path = None
         try:
-            with self._lock:
+            with self._lock, _state_file_io_lock:
                 target = os.path.abspath(self.state_file)
                 parent = os.path.dirname(target) or os.getcwd()
                 os.makedirs(parent, exist_ok=True)
@@ -111,7 +116,20 @@ class StateManager:
                     json.dump(self.state, tmp, indent=2, default=str)
                     tmp.flush()
                     os.fsync(tmp.fileno())
-                os.replace(temp_path, target)
+                for attempt in range(8):
+                    try:
+                        os.replace(temp_path, target)
+                        break
+                    except PermissionError as exc:
+                        # Windows may deny replacement while another process
+                        # briefly holds the destination open (e.g. AV scan).
+                        retryable = (
+                            getattr(exc, "winerror", None) in (5, 32)
+                            or exc.errno in (errno.EACCES, errno.EBUSY)
+                        )
+                        if not retryable or attempt == 7:
+                            raise
+                        time.sleep(min(0.05 * (2 ** attempt), 0.4))
                 temp_path = None
         except (IOError, OSError) as e:
             logger.error(f"❌ Gagal simpan state: {e}")
