@@ -180,6 +180,7 @@ def _enrich_state(state):
             "balance_usage_percent": config.BALANCE_USAGE * 100,
             "risk_per_trade_percent": config.RISK_PER_TRADE_PERCENT,
             "signal_min_score": config.SIGNAL_MIN_SCORE,
+            "entry_strategy": config.ENTRY_STRATEGY,
             "scanner_top_n": config.SCANNER_TOP_N,
             "timeframe": config.TRADING_TIMEFRAME,
             "higher_timeframe": config.HIGHER_TIMEFRAME,

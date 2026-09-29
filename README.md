@@ -1,6 +1,6 @@
 # Binance Futures Trading Bot
 
-Bot trading otomatis untuk Binance USDT-M Futures dengan strategi **Trend-Pullback & Liquidity Rejection (TPLR)**, satu posisi aktif, limit entry dinamis, serta proteksi posisi melalui adaptive exchange hard-stop dan trailing-stop ratchet.
+Bot trading otomatis untuk Binance USDT-M Futures dengan dua pilihan strategi entry: **Trend-Pullback & Liquidity Rejection (TPLR)** dan **SMC-EMA supply/demand**, satu posisi aktif, limit entry dinamis, serta proteksi posisi melalui exchange hard-stop dan trailing-stop ratchet.
 
 > Status proyek: tahap pengembangan. Hardening recovery dan order lifecycle sudah diimplementasikan, tetapi tetap wajib divalidasi cukup lama di testnet sebelum memakai dana riil.
 
@@ -12,7 +12,7 @@ Bot trading otomatis untuk Binance USDT-M Futures dengan strategi **Trend-Pullba
 | Binance Futures | USDT perpetual futures melalui CCXT |
 | Leverage dan margin | Fixed 2x, isolated margin |
 | Market scanner | Hanya underlying crypto (`COIN`), lalu top N sesuai konfigurasi berdasarkan volume, volatilitas, spread, dan blacklist |
-| Strategi | TPLR: macro trend, EMA value zone, pullback, rejection candle, RSI, volume, dan ATR |
+| Strategi | Pilih TPLR (default) atau SMC_EMA: zona swing, retest, break struktur, EMA, dan minimum reward/risk |
 | Multi-timeframe | 1H untuk arah makro dan 15m untuk setup entry |
 | BTC dominance filter | BTCDOMUSDT 1H untuk proyeksi entry altcoin dan 15m untuk exit reversal |
 | Dynamic limit entry | Harga limit dihitung dari EMA 21 dan ATR pullback |
@@ -90,6 +90,8 @@ Login default adalah username `qais` dan password `User\@mis1`. Nilai ini dapat 
 
 Halaman `/admin` hanya mengekspos parameter strategi yang di-whitelist. Perubahan divalidasi, langsung diterapkan ke proses bot, lalu disimpan atomik ke `strategy_overrides.json` agar tetap aktif setelah restart. API key, API secret, trading mode, mandatory stop, dan maksimum posisi tidak dapat diubah dari panel.
 
+Pilihan **Entry strategy** pada admin panel menerima `TPLR` atau `SMC_EMA`. Bot mengambil pilihan pada awal siklus baru; posisi yang sudah aktif tetap memakai stop/exit yang ada. Jika dashboard tidak dijalankan, hentikan bot dahulu lalu tambahkan `"ENTRY_STRATEGY": "SMC_EMA"` ke `strategy_overrides.json` dan mulai lagi. Jangan mengubah `bot_state.json` untuk memilih strategi. Deploy pertama tetap memakai TPLR sampai pilihan diubah secara eksplisit.
+
 ## Alur utama bot
 
 Setiap iterasi berjalan dengan prioritas berikut. Position dan pending order dapat hidup bersamaan sesaat ketika terjadi partial fill:
@@ -162,6 +164,14 @@ Bot memakai `BTCDOMUSDT` dari Binance sebagai proxy relative strength BTC terhad
 Analisis memakai candle 1H yang sudah close dan di-cache selama 60 detik. Filter tambahan memakai trend absolut BTCUSDT 1H: alt-long diblokir saat BTC bearish dan alt-short diblokir saat BTC bullish.
 
 > Seluruh keputusan entry, macro, dan reversal memakai candle yang sudah close. Candle aktif hanya dipakai sebagai referensi harga order.
+
+### 3b. Strategi alternatif SMC_EMA
+
+Strategi ini adalah definisi *mekanis* supply/demand, bukan interpretasi visual SMC yang subjektif. Dari candle 15m yang sudah tutup, bot mencari pivot swing terkonfirmasi, zona pivot yang tidak terlalu lebar, dan displacement minimal 1 ATR setelah pivot. Entry hanya dipertimbangkan bila zona belum ditembus oleh penutupan candle, diuji ulang dalam lima candle terakhir, dan candle pemicu menutup melewati struktur tiga candle sebelumnya. EMA21 harus searah dan volume candle minimal setara rata-rata 20 candle.
+
+LONG menggunakan demand; SHORT menggunakan supply secara simetris. Tren 1H/4H yang jelas berlawanan, tren BTC yang berlawanan, dan BTC.D yang berlawanan tetap memblokir entry altcoin. Bot menempatkan limit pada level break struktur untuk menunggu retest, bukan mengejar harga live. Stop wajib berada di luar zona ditambah buffer ATR, tidak boleh melebihi batas jarak stop yang sudah ada, dan target swing lawan harus menawarkan sedikitnya 1,5R. Bila salah satu syarat tidak terpenuhi, tidak ada order. Sinyal ini memakai sizing, mandatory exchange stop, TP/BEP, cooldown, dan proteksi order yang sama seperti TPLR.
+
+`SMC_EMA` adalah strategi baru yang belum dibuktikan profitabel. Uji pada data historis dan forward observation terlebih dahulu; memilih strategi berbeda tidak menjamin frekuensi ataupun win rate lebih tinggi. Monitor alasan penolakan pada Market Scanner dan hasil trade sebelum mempertimbangkan perubahan ambang.
 
 ### 4. Dynamic limit entry
 

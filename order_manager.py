@@ -381,7 +381,10 @@ class OrderManager:
                 timeout_min = config.NORMAL_CONVICTION_TIMEOUT_MINUTES
             
             # Hitung entry price: Dynamic Confluence vs Tiered Fixed Offset
-            if suggested_price is not None and suggested_price > 0 and getattr(config, "DYNAMIC_PULLBACK_ENTRY_ENABLED", True):
+            structural_limit = (signal_context or {}).get("strategy") == "SMC_EMA"
+            if suggested_price is not None and suggested_price > 0 and (
+                structural_limit or getattr(config, "DYNAMIC_PULLBACK_ENTRY_ENABLED", True)
+            ):
                 entry_price = float(suggested_price)
                 gap_pct = abs(current_price - entry_price) / current_price * 100
                 logger.info(

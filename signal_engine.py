@@ -16,6 +16,7 @@ import pandas as pd
 import ta as ta_lib
 from runtime_config import config
 from logger_setup import logger
+from smc_ema_strategy import SMCEMAStrategy
 
 
 class SignalEngine:
@@ -560,10 +561,91 @@ class SignalEngine:
         }
         return True, min(100, score), details
 
-    def analyze(self, symbol):
+    def _analyze_smc_ema(self, symbol):
+        """Independent supply/demand + EMA setup; existing execution is shared."""
+        result = {
+            "symbol": symbol, "signal": "WAIT", "score": 0, "details": {},
+            "higher_tf_bias": "neutral", "btc_market_bias": "neutral",
+            "btcdom_bias": "neutral", "market_projection": "balanced",
+            "price": 0, "strategy": "SMC_EMA",
+        }
+        try:
+            if symbol in config.BLACKLIST_COINS or symbol.replace(":USDT", "") in config.BLACKLIST_COINS:
+                result["details"] = {"reason": "blacklisted_coin"}
+                return result
+            frame = self.calculate_indicators(self.fetch_candles(symbol, config.TRADING_TIMEFRAME))
+            if frame.empty or len(frame) < 22:
+                result["details"] = {"reason": "smc_candles_unavailable"}
+                return result
+            result["price"] = float(frame.iloc[-1]["close"])
+            setup = SMCEMAStrategy.evaluate(frame.iloc[:-1])
+            result["details"] = setup["details"]
+            if setup["signal"] == "WAIT":
+                return result
+
+            side = setup["signal"].lower()
+            macro = self._get_macro_trend(symbol)
+            anchor = self._get_entry_anchor(symbol)
+            btc_market = self._get_btc_market_context()
+            btcdom = self._get_btcdom_context()
+            result.update(
+                higher_tf_bias=macro, btc_market_bias=btc_market["trend"],
+                btcdom_bias=btcdom["trend"], market_projection=btcdom["projection"],
+            )
+            opposite = "bearish" if side == "long" else "bullish"
+            aligned = "bullish" if side == "long" else "bearish"
+            if macro == opposite or anchor == opposite:
+                result["details"] = {"reason": "smc_higher_tf_opposes_entry", "macro": macro, "4h_trend": anchor}
+                return result
+            if not self._is_btc_symbol(symbol):
+                if config.BTC_MARKET_FILTER_ENABLED and (
+                    btc_market["trend"] == opposite or btc_market.get("reason") == "btc_market_unavailable"
+                ):
+                    result["details"] = {"reason": "smc_btc_market_blocks_entry", "btc_market": btc_market}
+                    return result
+                if (config.BTCDOM_FILTER_ENABLED and config.BTCDOM_STRICT_ENTRY_FILTER
+                        and btcdom["trend"] == ("bullish" if side == "long" else "bearish")):
+                    result["details"] = {"reason": "smc_btcdom_blocks_entry", "btcdom": btcdom}
+                    return result
+
+            entry = float(setup["suggested_entry_price"])
+            live = result["price"]
+            atr = float(setup["initial_stop_plan"]["atr"])
+            gap = (live - entry) if side == "long" else (entry - live)
+            if gap < 0 or gap > config.SMC_MAX_ENTRY_CHASE_ATR * atr:
+                result["details"] = {"reason": "smc_live_price_not_at_retest_range"}
+                return result
+
+            score = 85 + (5 if macro == aligned else 0) + (5 if anchor == aligned else 0)
+            score += 5 if setup["details"]["volume_ratio"] >= 1.3 else 0
+            result.update(
+                signal=setup["signal"], score=min(100, score),
+                suggested_entry_price=entry,
+                initial_stop_plan=setup["initial_stop_plan"],
+            )
+            result["details"].update({"macro": macro, "4h_trend": anchor,
+                                      "btc_market": btc_market, "btcdom": btcdom})
+            result["entry_signal_snapshot"] = {
+                "strategy": "SMC_EMA", "side": side,
+                "closed_candle_time": setup["details"]["closed_candle_time"],
+                "zone_edge": setup["details"]["zone_edge"],
+                "structure_break": setup["details"]["structure_break"],
+                "opposing_target": setup["details"]["opposing_target"],
+                "entry_price": entry,
+            }
+            return result
+        except Exception as exc:
+            logger.error("SMC-EMA analysis failed for %s: %s", symbol, exc)
+            result["details"] = {"reason": "smc_analysis_error"}
+            return result
+
+    def analyze(self, symbol, strategy=None):
         """
         Analisis komprehensif menggunakan Algoritma TPLR (Trend-Pullback & Liquidity Rejection).
         """
+        selected = (strategy or config.ENTRY_STRATEGY).upper()
+        if selected == "SMC_EMA":
+            return self._analyze_smc_ema(symbol)
         result = {
             "symbol": symbol,
             "signal": "WAIT",
@@ -573,7 +655,11 @@ class SignalEngine:
             "price": 0,
             "btcdom_bias": "neutral",
             "market_projection": "balanced",
+            "strategy": "TPLR",
         }
+        if selected != "TPLR":
+            result["details"] = {"reason": "unknown_entry_strategy"}
+            return result
         
         try:
             # Blacklist check
@@ -693,6 +779,7 @@ class SignalEngine:
                         symbol, "long", planned_entry, dataframe=df_15m
                     )
                     result["entry_signal_snapshot"] = {
+                        "strategy": "TPLR",
                         "closed_candle_time": str(last["timestamp"]),
                         "side": "long", "score": score_long,
                         "macro": macro_trend, "4h_trend": anchor_trend,
@@ -790,6 +877,7 @@ class SignalEngine:
                         symbol, "short", planned_entry, dataframe=df_15m
                     )
                     result["entry_signal_snapshot"] = {
+                        "strategy": "TPLR",
                         "closed_candle_time": str(last["timestamp"]),
                         "side": "short", "score": score_short,
                         "macro": macro_trend, "4h_trend": anchor_trend,
@@ -818,9 +906,40 @@ class SignalEngine:
             
         return result
     
-    def validate_pending_entry(self, symbol, side):
+    def validate_pending_entry(self, symbol, side, signal_snapshot=None):
         """Revalidasi setup sebelum limit order sempat terisi."""
-        fresh = self.analyze(symbol)
+        snapshot = signal_snapshot or {}
+        # Pending orders from before the strategy selector were all TPLR.
+        selected = snapshot.get("strategy") or "TPLR"
+        if selected == "SMC_EMA":
+            frame = self.calculate_indicators(self.fetch_candles(symbol, config.TRADING_TIMEFRAME))
+            if frame.empty or len(frame) < 3:
+                return {"valid": False, "reason": "smc_pending_candles_unavailable", "analysis": None}
+            closed, live = frame.iloc[-2], frame.iloc[-1]
+            edge = float(snapshot.get("zone_edge") or 0)
+            entry = float(snapshot.get("entry_price") or 0)
+            if edge <= 0 or entry <= 0:
+                return {"valid": False, "reason": "smc_pending_context_missing", "analysis": None}
+            if side.lower() == "long":
+                intact = float(closed["close"]) > edge and float(live["close"]) > edge
+            else:
+                intact = float(closed["close"]) < edge and float(live["close"]) < edge
+            if intact:
+                opposite = "bearish" if side.lower() == "long" else "bullish"
+                intact = (self._get_macro_trend(symbol) != opposite
+                          and self._get_entry_anchor(symbol) != opposite)
+                if intact and not self._is_btc_symbol(symbol):
+                    btc_market = self._get_btc_market_context()
+                    intact = (not config.BTC_MARKET_FILTER_ENABLED
+                              or btc_market["trend"] != opposite)
+                    if intact and config.BTCDOM_FILTER_ENABLED and config.BTCDOM_STRICT_ENTRY_FILTER:
+                        btcdom = self._get_btcdom_context()
+                        intact = btcdom["trend"] != (
+                            "bullish" if side.lower() == "long" else "bearish"
+                        )
+            reason = "smc_zone_still_valid" if intact else "smc_zone_invalidated"
+            return {"valid": intact, "reason": reason, "analysis": None}
+        fresh = self.analyze(symbol, strategy=selected)
         expected = side.upper()
         valid = (
             fresh.get("signal") == expected

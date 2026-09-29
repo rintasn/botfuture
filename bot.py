@@ -125,6 +125,7 @@ class TradingBot:
         )
         
         logger.info(f"  ⚙️  Timeframe: {config.TRADING_TIMEFRAME} (HTF: {config.HIGHER_TIMEFRAME})")
+        logger.info(f"  ⚙️  Entry strategy: {config.ENTRY_STRATEGY}")
         logger.info(f"  ⚙️  Leverage: {config.LEVERAGE}x | Margin: {config.MARGIN_MODE}")
         logger.info(f"  ⚙️  Cooldown Global: {config.SIGNAL_COOLDOWN_MINUTES}m | Symbol: {config.SYMBOL_COOLDOWN_MINUTES}m")
         logger.info(f"  ⚙️  Trailing Ratchet: Checkpoint {config.TRAILING_CHECKPOINT_PERCENT}%, Stop {config.TRAILING_FIRST_STOP_PERCENT}%")
@@ -453,7 +454,9 @@ class TradingBot:
             revalidate_every = float(getattr(config, "PENDING_REVALIDATION_SECONDS", 30))
             last_validation = float(order.get("last_signal_validation", 0) or 0)
             if time.time() - last_validation >= revalidate_every:
-                validation = self.signal_engine.validate_pending_entry(symbol, order["side"])
+                validation = self.signal_engine.validate_pending_entry(
+                    symbol, order["side"], order.get("entry_signal_snapshot")
+                )
                 self.state.mark_pending_validated()
                 if not validation["valid"]:
                     logger.warning(
@@ -732,6 +735,7 @@ class TradingBot:
             "processed_count": 0,
             "accepted_count": 0,
             "error": getattr(self.scanner, "last_error", None),
+            "strategy": config.ENTRY_STRATEGY,
             "markets": [
                 {
                     "symbol": item["symbol"],
@@ -742,6 +746,7 @@ class TradingBot:
                     "scan_score": item.get("scan_score"),
                     "status": "queued", "signal": "WAIT", "score": 0,
                     "reason": "", "higher_tf_bias": "neutral",
+                    "strategy": config.ENTRY_STRATEGY,
                     "btc_market_bias": "neutral", "btcdom_bias": "neutral",
                 }
                 for item in candidates
@@ -772,6 +777,7 @@ class TradingBot:
                     higher_tf_bias=signal_result.get("higher_tf_bias", "neutral"),
                     btc_market_bias=signal_result.get("btc_market_bias", "neutral"),
                     btcdom_bias=signal_result.get("btcdom_bias", "neutral"),
+                    strategy=signal_result.get("strategy", config.ENTRY_STRATEGY),
                 )
                 if signal_result["signal"] in ("LONG", "SHORT") and signal_result["score"] >= config.SIGNAL_MIN_SCORE:
                     row["status"] = "qualified"

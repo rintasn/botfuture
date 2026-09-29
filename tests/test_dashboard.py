@@ -14,6 +14,7 @@ class DashboardTests(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.original_runtime_file = config.RUNTIME_CONFIG_FILE
         self.original_score = config.SIGNAL_MIN_SCORE
+        self.original_strategy = config.ENTRY_STRATEGY
         config.RUNTIME_CONFIG_FILE = os.path.join(self.tempdir.name, "overrides.json")
         app.config.update(TESTING=True)
         self.client = app.test_client()
@@ -22,6 +23,7 @@ class DashboardTests(unittest.TestCase):
     def tearDown(self):
         config.RUNTIME_CONFIG_FILE = self.original_runtime_file
         config.SIGNAL_MIN_SCORE = self.original_score
+        config.ENTRY_STRATEGY = self.original_strategy
         self.tempdir.cleanup()
 
     def login(self):
@@ -110,6 +112,23 @@ class DashboardTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 302)
         self.assertEqual(config.SIGNAL_MIN_SCORE, 88)
+
+    def test_admin_can_select_smc_ema_and_reject_unknown_strategy(self):
+        self.login()
+        with self.client.session_transaction() as session:
+            csrf = session["csrf_token"]
+        admin = self.client.get("/admin")
+        self.assertIn(b'name="ENTRY_STRATEGY"', admin.data)
+        self.client.post("/admin/config", data={
+            "csrf_token": csrf, "ENTRY_STRATEGY": "SMC_EMA",
+        })
+        self.assertEqual(config.ENTRY_STRATEGY, "SMC_EMA")
+        with open(config.RUNTIME_CONFIG_FILE, "r", encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["ENTRY_STRATEGY"], "SMC_EMA")
+        self.client.post("/admin/config", data={
+            "csrf_token": csrf, "ENTRY_STRATEGY": "UNKNOWN",
+        })
+        self.assertEqual(config.ENTRY_STRATEGY, "SMC_EMA")
 
 
 if __name__ == "__main__":

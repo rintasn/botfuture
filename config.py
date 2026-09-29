@@ -162,6 +162,7 @@ STOP_DEDUPLICATION_ENABLED = True
 # =============================================================================
 # SIGNAL ENGINE SETTINGS (Institutional TPLR)
 # =============================================================================
+ENTRY_STRATEGY = "TPLR"          # TPLR atau SMC_EMA; hanya satu aktif per siklus
 SIGNAL_MIN_SCORE = 85           # Entry dibuat lebih selektif; skor kini dimulai dari 0
 NEUTRAL_REGIME_MIN_SCORE = 92   # Hanya setup luar biasa yang boleh lolos regime netral
 ENTRY_REQUIRE_4H_ALIGNMENT = True
@@ -171,6 +172,20 @@ ENTRY_MIN_15M_VOLUME_RATIO = 1.0
 ENTRY_MAX_EMA21_DISTANCE_ATR = 1.0
 ENTRY_MAX_LIVE_DISTANCE_ATR = 1.5
 ENTRY_CONFIRM_TIMEFRAME = "4h"
+
+# SMC-EMA: zona swing yang diikuti displacement, retest, lalu break struktur.
+# Semua struktur dihitung dari candle 15m yang sudah tutup.
+SMC_LOOKBACK_CANDLES = 48
+SMC_PIVOT_BARS = 2
+SMC_DISPLACEMENT_BARS = 6
+SMC_DISPLACEMENT_ATR = 1.0
+SMC_MAX_ZONE_WIDTH_ATR = 0.8
+SMC_RETEST_BARS = 5
+SMC_BREAK_BARS = 3
+SMC_MIN_VOLUME_RATIO = 1.0
+SMC_MIN_REWARD_RISK = 1.5
+SMC_STOP_BUFFER_ATR = 0.25
+SMC_MAX_ENTRY_CHASE_ATR = 0.75
 
 # EMA Parameters
 EMA_FAST = 21
@@ -309,6 +324,7 @@ TP_PRICE_CAP_ENABLED = True
 # Hanya parameter berikut yang dapat diubah dari admin panel. API credentials,
 # TRADING_MODE, MAX_POSITIONS, dan proteksi wajib sengaja tidak diekspos.
 ADMIN_EDITABLE_CONFIG = {
+    "ENTRY_STRATEGY": {"type": "choice", "choices": ("TPLR", "SMC_EMA"), "category": "Entry", "label": "Entry strategy"},
     "TP_PRICE_CAP_ENABLED": {"type": "bool", "category": "Exit", "label": "Cap TP price (OFF = pure R)"},
     "ENTRY_REQUIRE_4H_ALIGNMENT": {"type": "bool", "category": "Entry", "label": "Require 4h trend alignment"},
     "ENTRY_SKIP_NEUTRAL_BTC": {"type": "bool", "category": "Entry", "label": "Skip alt entries while BTC regime neutral"},
@@ -359,6 +375,11 @@ def _coerce_admin_value(name, value):
     """Validasi nilai admin terhadap whitelist dan batas aman."""
     meta = ADMIN_EDITABLE_CONFIG[name]
     kind = meta["type"]
+    if kind == "choice":
+        parsed = str(value).upper()
+        if parsed not in meta["choices"]:
+            raise ValueError(f"{name} harus salah satu dari {', '.join(meta['choices'])}")
+        return parsed
     if kind == "bool":
         if isinstance(value, bool):
             parsed = value
